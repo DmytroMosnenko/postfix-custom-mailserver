@@ -1,0 +1,6 @@
+# IDE
+.DS_Store
+
+# RPM build artifacts
+*.rpm
+~/rpmbuild/
