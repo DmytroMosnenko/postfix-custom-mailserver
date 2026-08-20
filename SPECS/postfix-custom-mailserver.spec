@@ -3,8 +3,9 @@ Version:        2.0
 Release:        1%{?dist}
 Summary:        Idempotent Postfix and OpenDKIM integration for application mail delivery
 License:        MIT
-URL:            https://github.com/custom/postfix-custom-mailserver
+URL:            https://github.com/DmytroMosnenko/postfix-custom-mailserver
 BuildArch:      noarch
+Source0:        postfix-custom-mailserver-%{version}.tar.gz
 
 Requires:       postfix
 Requires:       cyrus-sasl
@@ -22,21 +23,25 @@ administrator configuration outside the managed blocks is preserved.
 
 %prep
 
+%setup -q
+
 %build
 
 %install
 rm -rf %{buildroot}
-install -D -m 0755 %{_sourcedir}/mailserver-configure.sh \
+
+install -D -m 0755 SOURCES/mailserver-configure.sh \
     %{buildroot}%{_libexecdir}/%{name}/mailserver-configure.sh
-install -D -m 0755 %{_sourcedir}/generate-dkim-key.sh \
+install -D -m 0755 SOURCES/generate-dkim-key.sh \
     %{buildroot}%{_libexecdir}/%{name}/generate-dkim-key.sh
-install -D -m 0755 %{_sourcedir}/add-alias.sh \
+install -D -m 0755 SOURCES/add-alias.sh \
     %{buildroot}%{_libexecdir}/%{name}/add-alias.sh
-install -D -m 0755 %{_sourcedir}/mailserver-validate.sh \
+install -D -m 0755 SOURCES/mailserver-validate.sh \
     %{buildroot}%{_libexecdir}/%{name}/mailserver-validate.sh
-install -D -m 0644 %{_sourcedir}/README.md \
+
+install -D -m 0644 README.md \
     %{buildroot}%{_docdir}/%{name}/README.md
-install -D -m 0644 %{_sourcedir}/LICENSE \
+install -D -m 0644 LICENSE \
     %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 %pre
