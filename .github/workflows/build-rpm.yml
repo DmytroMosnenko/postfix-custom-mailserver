@@ -12,6 +12,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        shell: bash
+
     # Build on the same RPM-family platform as the primary target.
     container:
       image: public.ecr.aws/amazonlinux/amazonlinux:2023
@@ -158,13 +162,28 @@ jobs:
           set -euo pipefail
 
           VERSION="${{ steps.version.outputs.version }}"
-          RPM="$HOME/rpmbuild/RPMS/noarch/postfix-custom-mailserver-${VERSION}-1.*.noarch.rpm"
-          SRPM="$HOME/rpmbuild/SRPMS/postfix-custom-mailserver-${VERSION}-1.src.rpm"
 
-          compgen -G "$RPM" >/dev/null
-          test -f "$SRPM"
+          RPM_FILE=$(find "$HOME/rpmbuild/RPMS" \
+            -type f \
+            -name "postfix-custom-mailserver-${VERSION}-*.noarch.rpm" \
+            -print -quit)
 
-          RPM_FILE=$(compgen -G "$RPM" | head -n1)
+          SRPM_FILE=$(find "$HOME/rpmbuild/SRPMS" \
+            -type f \
+            -name "postfix-custom-mailserver-${VERSION}-*.src.rpm" \
+            -print -quit)
+
+          test -n "$RPM_FILE" || {
+            echo "Binary RPM not found for version ${VERSION}." >&2
+            find "$HOME/rpmbuild/RPMS" -type f -print >&2 || true
+            exit 1
+          }
+
+          test -n "$SRPM_FILE" || {
+            echo "Source RPM not found for version ${VERSION}." >&2
+            find "$HOME/rpmbuild/SRPMS" -type f -print >&2 || true
+            exit 1
+          }
 
           echo "Binary RPM: $RPM_FILE"
           rpm -qip "$RPM_FILE"
@@ -172,8 +191,8 @@ jobs:
           echo "RPM contents:"
           rpm -qlp "$RPM_FILE"
           echo
-          echo "SRPM: $SRPM"
-          rpm -qip "$SRPM"
+          echo "SRPM: $SRPM_FILE"
+          rpm -qip "$SRPM_FILE"
 
       - name: Collect release files
         run: |
