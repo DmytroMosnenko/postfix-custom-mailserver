@@ -1,5 +1,5 @@
 Name:           postfix-custom-mailserver
-Version:        2.0
+Version:        0.0.0
 Release:        1%{?dist}
 Summary:        Idempotent Postfix and OpenDKIM integration for application mail delivery
 License:        MIT
@@ -22,8 +22,7 @@ configuration block to existing Postfix/OpenDKIM configuration files. Existing
 administrator configuration outside the managed blocks is preserved.
 
 %prep
-
-%setup -q
+%setup -q -n %{name}-%{version}
 
 %build
 
@@ -45,8 +44,7 @@ install -D -m 0644 LICENSE \
     %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 %pre
-# Do not create or modify service accounts here. The required Postfix/OpenDKIM
-# packages own their users/groups.
+# Postfix and OpenDKIM own their service accounts. Do not create or modify them.
 exit 0
 
 %post
@@ -59,8 +57,8 @@ if [ -x %{_libexecdir}/%{name}/mailserver-configure.sh ]; then
     }
 fi
 
-# We enable the existing services but do not start services that were stopped.
-# On an already-running service, the helper reloads/restarts only after validation.
+# Enable the existing services but do not start services that were stopped.
+# The configuration helper reloads/restarts only services that were already active.
 systemctl daemon-reload >/dev/null 2>&1 || :
 systemctl enable postfix.service >/dev/null 2>&1 || :
 systemctl enable opendkim.service >/dev/null 2>&1 || :
@@ -68,11 +66,8 @@ systemctl enable opendkim.service >/dev/null 2>&1 || :
 exit 0
 
 %preun
-if [ "$1" -eq 0 ]; then
-    # Package removal must not disable or stop the user's mail services and must
-    # not delete administrator configuration. Only package-owned helper files go.
-    :
-fi
+# On package removal, deliberately leave Postfix/OpenDKIM services and all
+# administrator configuration untouched.
 exit 0
 
 %postun
@@ -88,7 +83,7 @@ exit 0
 %{_libexecdir}/%{name}/mailserver-validate.sh
 
 %changelog
-* Thu Aug 20 2026 SysAdmin <admin@customserver.org> - 2.0-1
+* Thu Aug 20 2026 Package Maintainer <amidtrader@gmail.com> - 0.0.0-1
 - Reworked package for idempotent install and upgrade behavior.
 - Preserve administrator Postfix/OpenDKIM configuration outside managed blocks.
 - Explicitly configure the OpenDKIM TCP socket used by Postfix.

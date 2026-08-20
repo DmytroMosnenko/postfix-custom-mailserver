@@ -1,72 +1,137 @@
-# postfix-custom-mailserver 2.0
+# postfix-custom-mailserver
 
-Private RPM for configuring Postfix + OpenDKIM for application mail delivery on RPM-based Linux systems.
+RPM packaging for a Postfix + OpenDKIM mail-server integration on RPM-based Linux systems.
 
-## Design goals
+## Targets
 
-- Idempotent install and upgrade.
-- Preserve administrator configuration outside package-managed blocks.
-- Never overwrite an existing OpenDKIM `TrustedHosts` file.
-- Never regenerate an existing DKIM private key.
-- Never stop a service that was already stopped.
-- Never start a service merely because the RPM was installed.
-- Explicitly configure the OpenDKIM TCP socket used by Postfix.
-- Keep runtime state and private keys outside RPM-owned files.
-- Package removal removes only the helper programs, not mail-server configuration or keys.
+The package is built on Amazon Linux 2023 and is intended for:
 
-## Installation
+- Amazon Linux 2023
+- AlmaLinux 9
 
-```bash
-sudo dnf install ./postfix-custom-mailserver-2.0-1*.rpm
+The package is `noarch`; it contains shell scripts and configuration logic rather than compiled binaries.
+
+## What the RPM does
+
+The RPM installs administrative helpers under:
+
+```text
+/usr/libexec/postfix-custom-mailserver/
 ```
 
-The package applies its managed configuration block and enables Postfix/OpenDKIM for boot. If a service was already running, configuration is reloaded/restarted after validation. A stopped service remains stopped.
+It also applies a managed Postfix/OpenDKIM configuration during installation and upgrade.
 
-## Validate
+The configuration is designed to be idempotent:
+
+- repeated installation does not append duplicate Postfix settings;
+- existing administrator configuration outside the managed block is preserved;
+- existing OpenDKIM `TrustedHosts` entries are preserved;
+- existing DKIM keys are never silently replaced;
+- package removal does not stop or disable the mail services;
+- package removal does not delete mail-server configuration or DKIM keys.
+
+## Versioning
+
+The repository keeps a neutral RPM version in the spec file:
+
+```spec
+Version: 0.0.0
+```
+
+The GitHub Actions workflow replaces this value with the Git tag version.
+
+For example:
+
+```bash
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+builds:
+
+```text
+postfix-custom-mailserver-2.1.0-1.*.noarch.rpm
+postfix-custom-mailserver-2.1.0-1.src.rpm
+```
+
+The Git tag is therefore the authoritative application/package version.
+
+## Build locally
+
+On an RPM-based build host:
+
+```bash
+sudo dnf install rpm-build rpmdevtools systemd-rpm-macros tar gzip
+rpmdev-setuptree
+```
+
+Create a source archive whose top-level directory is:
+
+```text
+postfix-custom-mailserver-VERSION/
+```
+
+and contains `SOURCES/`, `README.md`, and `LICENSE`.
+
+Then copy the archive to `~/rpmbuild/SOURCES/`, copy the spec to `~/rpmbuild/SPECS/`, set the desired `Version:` in the spec, and run:
+
+```bash
+rpmbuild -ba ~/rpmbuild/SPECS/postfix-custom-mailserver.spec
+```
+
+The GitHub workflow performs these steps automatically from a release tag.
+
+## Release
+
+Push a tag using the format:
+
+```text
+vMAJOR.MINOR.PATCH
+```
+
+For example:
+
+```bash
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+The workflow builds the RPM and SRPM in an Amazon Linux 2023 container and attaches both to the GitHub Release.
+
+## Administration helpers
+
+Configure or re-apply the managed configuration:
+
+```bash
+sudo /usr/libexec/postfix-custom-mailserver/mailserver-configure.sh --apply
+```
+
+Show service status:
+
+```bash
+sudo /usr/libexec/postfix-custom-mailserver/mailserver-configure.sh --status
+```
+
+Validate the installation:
 
 ```bash
 sudo /usr/libexec/postfix-custom-mailserver/mailserver-validate.sh
 ```
 
-## Add a domain / generate DKIM
+Generate a DKIM key:
 
 ```bash
 sudo /usr/libexec/postfix-custom-mailserver/generate-dkim-key.sh example.com
 ```
 
-The command prints the DNS TXT record. Do not regenerate a key just because DNS has not propagated.
-
-## Add an alias
+Add a local alias:
 
 ```bash
-sudo /usr/libexec/postfix-custom-mailserver/add-alias.sh admin destination@example.com
+sudo /usr/libexec/postfix-custom-mailserver/add-alias.sh admin admin@example.com
 ```
 
-Existing aliases are never silently replaced.
+## Important
 
-## Managed configuration
+The RPM expects the required Postfix/OpenDKIM packages to be available from the configured repositories. Package availability can differ between distributions and repository configurations.
 
-Postfix receives a clearly delimited block in `/etc/postfix/main.cf`:
-
-```text
-# BEGIN postfix-custom-mailserver
-...
-# END postfix-custom-mailserver
-```
-
-OpenDKIM settings are updated by key rather than by appending duplicate settings.
-
-A one-time backup is kept at:
-
-- `/etc/postfix/main.cf.postfix-custom-mailserver.orig`
-- `/etc/opendkim.conf.postfix-custom-mailserver.orig`
-
-These backups are intentionally not removed on RPM erase.
-
-## Upgrade behavior
-
-Repeated installs/upgrades are safe. The Postfix managed block is replaced rather than appended repeatedly. Existing administrator settings outside the block are preserved.
-
-## Important operational note
-
-This package assumes the operating system's Postfix and OpenDKIM packages are already correctly packaged for the target distribution. In particular, OpenDKIM must provide the `opendkim` user/group and `opendkim-genkey` utility.
+The RPM intentionally does not contain a DKIM private key. DKIM keys are generated on the target server and remain outside the RPM payload.

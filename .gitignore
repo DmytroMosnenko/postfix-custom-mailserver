@@ -1,6 +1,18 @@
-# IDE
-.DS_Store
+# RPM build output
+rpmbuild/
+build/
+BUILD/
+BUILDROOT/
+RPMS/
+SOURCES/*.tar.gz
+SRPMS/
 
-# RPM build artifacts
+# Local generated artifacts
+dist/
 *.rpm
-~/rpmbuild/
+*.src.rpm
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/

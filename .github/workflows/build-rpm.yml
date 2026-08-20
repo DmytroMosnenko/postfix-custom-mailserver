@@ -3,8 +3,7 @@ name: Build Postfix Custom Mailserver RPM
 on:
   push:
     tags:
-      - "v*"
-  workflow_dispatch:
+      - 'v*'
 
 permissions:
   contents: write
@@ -13,14 +12,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # Build inside Amazon Linux 2023 for maximum compatibility
-    # with the target Amazon Linux environment.
+    # Build on the same RPM-family platform as the primary target.
     container:
       image: public.ecr.aws/amazonlinux/amazonlinux:2023
 
     steps:
       - name: Install build tools
         run: |
+          set -euo pipefail
           dnf -y update
           dnf -y install \
             rpm-build \
@@ -39,200 +38,165 @@ jobs:
           fetch-depth: 0
 
       - name: Mark repository as safe for git
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Derive RPM version
-        id: ver
+      - name: Derive RPM version from tag
+        id: version
         shell: bash
         run: |
+          set -euo pipefail
+
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
-            echo "This workflow is intended to build releases from tags."
+            echo "This workflow must be run from a Git tag."
             exit 1
           fi
 
           TAG="${GITHUB_REF_NAME}"
-
-          # v2.1.0 -> 2.1.0
           VERSION="${TAG#v}"
 
-          # Basic RPM version validation.
+          # Require a conventional RPM-compatible numeric version.
           if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-            echo "Invalid RPM version: $VERSION"
-            echo "Expected tag format: vMAJOR.MINOR.PATCH"
+            echo "Invalid tag: $TAG"
+            echo "Expected: vMAJOR.MINOR.PATCH (for example v2.1.0)"
             exit 1
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building RPM version: $VERSION"
 
-          echo "Git tag:     $TAG"
-          echo "RPM version: $VERSION"
+      - name: Setup rpmbuild tree
+        run: rpmdev-setuptree
 
-      - name: Show repository contents
+      - name: Validate repository layout
         run: |
-          echo "Repository:"
-          find . -maxdepth 3 -type f -print | sort
+          set -euo pipefail
 
-      - name: Validate source files
-        run: |
-          set -e
+          required=(
+            SPECS/postfix-custom-mailserver.spec
+            SOURCES/mailserver-configure.sh
+            SOURCES/generate-dkim-key.sh
+            SOURCES/add-alias.sh
+            SOURCES/mailserver-validate.sh
+            README.md
+            LICENSE
+          )
 
-          test -f "SPECS/postfix-custom-mailserver.spec"
-
-          test -f "SOURCES/mailserver-configure.sh"
-          test -f "SOURCES/generate-dkim-key.sh"
-          test -f "SOURCES/add-alias.sh"
-          test -f "SOURCES/mailserver-validate.sh"
-
-          echo "All required packaging files are present."
+          for path in "${required[@]}"; do
+            if [[ ! -f "$path" ]]; then
+              echo "Missing required file: $path" >&2
+              exit 1
+            fi
+          done
 
       - name: Validate shell scripts
         run: |
-          set -e
+          set -euo pipefail
 
-          for script in \
-            SOURCES/mailserver-configure.sh \
-            SOURCES/generate-dkim-key.sh \
-            SOURCES/add-alias.sh \
-            SOURCES/mailserver-validate.sh
-          do
+          for script in SOURCES/*.sh; do
             echo "Checking $script"
             bash -n "$script"
           done
 
-      - name: Setup rpmbuild tree
-        run: |
-          rpmdev-setuptree
-
       - name: Create source tarball
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
+          set -euo pipefail
 
-          SOURCE_ROOT="postfix-custom-mailserver-${VERSION}"
-          SOURCE_TARBALL="$HOME/rpmbuild/SOURCES/${SOURCE_ROOT}.tar.gz"
+          VERSION="${{ steps.version.outputs.version }}"
+          ROOT="postfix-custom-mailserver-${VERSION}"
+          TARBALL="$HOME/rpmbuild/SOURCES/${ROOT}.tar.gz"
 
-          echo "Creating:"
-          echo "  $SOURCE_TARBALL"
-          echo "with root directory:"
-          echo "  $SOURCE_ROOT/"
+          mkdir -p "$ROOT/SOURCES"
+          cp SOURCES/*.sh "$ROOT/SOURCES/"
+          cp README.md LICENSE "$ROOT/"
 
-          tar \
-            --exclude-vcs \
-            --exclude="./dist" \
-            --exclude="./.github" \
-            -czf "$SOURCE_TARBALL" \
-            --transform="s|^.|${SOURCE_ROOT}|" \
-            -C . .
+          tar -czf "$TARBALL" "$ROOT"
+          rm -rf "$ROOT"
 
-          echo
-          echo "Tarball contents:"
-          tar -tzf "$SOURCE_TARBALL" | head -100
+          echo "Created source archive: $TARBALL"
+          tar -tzf "$TARBALL"
 
-      - name: Prepare SPEC file
+      - name: Prepare SPEC
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
+          set -euo pipefail
 
-          cp \
-            SPECS/postfix-custom-mailserver.spec \
-            "$HOME/rpmbuild/SPECS/"
-
+          VERSION="${{ steps.version.outputs.version }}"
           SPEC="$HOME/rpmbuild/SPECS/postfix-custom-mailserver.spec"
 
-          # Set the version from the Git tag.
-          sed -i \
-            "s|^Version:.*|Version:        ${VERSION}|" \
-            "$SPEC"
+          cp SPECS/postfix-custom-mailserver.spec "$SPEC"
 
-          # Source archive generated by this workflow.
-          sed -i \
-            's|^Source0:.*|Source0:        postfix-custom-mailserver-%{version}.tar.gz|' \
-            "$SPEC"
+          # The repository keeps a neutral placeholder version. The Git tag is
+          # the authoritative release version.
+          sed -i "s/^Version:[[:space:]]*.*/Version:        ${VERSION}/" "$SPEC"
 
           echo "Prepared SPEC:"
           cat "$SPEC"
 
       - name: Validate SPEC metadata
         run: |
+          set -euo pipefail
+
           SPEC="$HOME/rpmbuild/SPECS/postfix-custom-mailserver.spec"
+          VERSION="${{ steps.version.outputs.version }}"
 
-          echo "Checking RPM metadata..."
+          rpmspec --parse "$SPEC" >/dev/null
 
-          rpm --eval '%{_target_cpu}'
-          rpm --eval '%{_target_os}'
-          rpm --eval '%{_target_vendor}'
+          grep -Eq "^Version:[[:space:]]+${VERSION}$" "$SPEC"
+          grep -Eq '^Source0:[[:space:]]+postfix-custom-mailserver-%\{version\}\.tar\.gz$' "$SPEC"
+          grep -q '^%setup -q -n %{name}-%{version}$' "$SPEC"
 
-          grep -E '^(Name|Version|Release|Summary|License|URL|Source0|BuildArch):' "$SPEC"
+          echo "SPEC metadata and source layout are consistent."
 
-      - name: Build RPM
+      - name: Build RPM and SRPM
         run: |
-          SPEC="$HOME/rpmbuild/SPECS/postfix-custom-mailserver.spec"
+          set -euo pipefail
 
+          SPEC="$HOME/rpmbuild/SPECS/postfix-custom-mailserver.spec"
           rpmbuild -ba "$SPEC"
 
-      - name: Verify RPM
+      - name: Verify built packages
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Binary RPMs:"
-          find "$HOME/rpmbuild/RPMS" \
-            -type f \
-            -name "*.rpm" \
-            -print
+          VERSION="${{ steps.version.outputs.version }}"
+          RPM="$HOME/rpmbuild/RPMS/noarch/postfix-custom-mailserver-${VERSION}-1.*.noarch.rpm"
+          SRPM="$HOME/rpmbuild/SRPMS/postfix-custom-mailserver-${VERSION}-1.src.rpm"
 
+          compgen -G "$RPM" >/dev/null
+          test -f "$SRPM"
+
+          RPM_FILE=$(compgen -G "$RPM" | head -n1)
+
+          echo "Binary RPM: $RPM_FILE"
+          rpm -qip "$RPM_FILE"
           echo
-          echo "Source RPMs:"
-          find "$HOME/rpmbuild/SRPMS" \
-            -type f \
-            -name "*.src.rpm" \
-            -print
-
+          echo "RPM contents:"
+          rpm -qlp "$RPM_FILE"
           echo
-          echo "RPM metadata:"
-          for rpm in "$HOME"/rpmbuild/RPMS/*/*.rpm; do
-            echo
-            echo "========================================"
-            echo "$rpm"
-            echo "========================================"
-            rpm -qip "$rpm"
-          done
+          echo "SRPM: $SRPM"
+          rpm -qip "$SRPM"
 
-      - name: Collect RPMs
+      - name: Collect release files
         run: |
-          set -e
+          set -euo pipefail
 
-          mkdir -p dist/rpms
-          mkdir -p dist/srpms
+          mkdir -p dist
+          find "$HOME/rpmbuild/RPMS" -type f -name '*.rpm' -exec cp -v {} dist/ \;
+          find "$HOME/rpmbuild/SRPMS" -type f -name '*.src.rpm' -exec cp -v {} dist/ \;
 
-          find "$HOME/rpmbuild/RPMS" \
-            -type f \
-            -name "*.rpm" \
-            -exec cp -v {} dist/rpms/ \;
+          echo "Release files:"
+          ls -lh dist/
 
-          find "$HOME/rpmbuild/SRPMS" \
-            -type f \
-            -name "*.src.rpm" \
-            -exec cp -v {} dist/srpms/ \;
-
-          echo
-          echo "Collected artifacts:"
-          find dist -type f -print
-
-      - name: Upload RPM artifacts
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: postfix-custom-mailserver-rpms-${{ steps.ver.outputs.version }}
-          path: |
-            dist/rpms/*.rpm
-            dist/srpms/*.src.rpm
+          name: postfix-custom-mailserver-rpms-${{ steps.version.outputs.version }}
+          path: dist/*
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          files: |
-            dist/rpms/*.rpm
-            dist/srpms/*.src.rpm
+          files: dist/*
           generate_release_notes: true
