@@ -1,203 +1,205 @@
-#!/bin/bash
-set -u
+#!/usr/bin/env bash
 
-readonly POSTFIX_MAIN_CF="/etc/postfix/main.cf"
-readonly OPENDKIM_CONF="/etc/opendkim.conf"
-readonly OPENDKIM_DIR="/etc/opendkim"
-readonly TRUSTED_HOSTS="${OPENDKIM_DIR}/TrustedHosts"
-readonly KEY_TABLE="${OPENDKIM_DIR}/KeyTable"
-readonly SIGNING_TABLE="${OPENDKIM_DIR}/SigningTable"
-readonly MARKER_START="# BEGIN postfix-custom-mailserver"
-readonly MARKER_END="# END postfix-custom-mailserver"
-readonly OPENDKIM_MARKER_START="# BEGIN postfix-custom-mailserver"
-readonly OPENDKIM_MARKER_END="# END postfix-custom-mailserver"
-readonly POSTFIX_BACKUP="/etc/postfix/main.cf.postfix-custom-mailserver.orig"
-readonly OPENDKIM_BACKUP="/etc/opendkim.conf.postfix-custom-mailserver.orig"
+set -euo pipefail
 
-log() { printf '[postfix-custom-mailserver] %s\n' "$*"; }
-warn() { printf '[postfix-custom-mailserver] WARNING: %s\n' "$*" >&2; }
-die() { printf '[postfix-custom-mailserver] ERROR: %s\n' "$*" >&2; exit 1; }
+ACTION="${1:-}"
 
-require_root() {
-    [ "$(id -u)" -eq 0 ] || die "must be run as root"
-}
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: this script must be run as root." >&2
+    exit 1
+fi
 
-require_cmds() {
-    local cmd
-    for cmd in awk sed grep install mktemp systemctl postfix postconf; do
-        command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
-    done
-}
+if [[ "${ACTION}" != "--apply" ]]; then
+    echo "Usage: $0 --apply"
+    exit 2
+fi
 
-backup_once() {
-    local src="$1" backup="$2"
-    [ -f "$src" ] || return 0
-    [ -e "$backup" ] || cp -a -- "$src" "$backup"
-}
+POSTFIX_MAIN_CF="/etc/postfix/main.cf"
+OPENDKIM_CONF="/etc/opendkim.conf"
+OPENDKIM_DIR="/etc/opendkim"
+OPENDKIM_KEYS_DIR="${OPENDKIM_DIR}/keys"
 
-replace_managed_block() {
-    local file="$1" start="$2" end="$3" block_file="$4"
-    local tmp
-    tmp=$(mktemp "${file}.XXXXXX") || return 1
+echo "[postfix-custom-mailserver] Applying configuration..."
 
-    awk -v start="$start" -v end="$end" -v replacement="$block_file" '
-        BEGIN { in_block=0; inserted=0 }
-        $0 == start {
-            if (!inserted) {
-                while ((getline line < replacement) > 0) print line
-                close(replacement)
-                inserted=1
-            }
-            in_block=1
-            next
-        }
-        $0 == end {
-            in_block=0
-            next
-        }
-        !in_block { print }
-        END {
-            if (!inserted) {
-                # The replacement is appended by the shell below.
-            }
-        }
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+# ---------------------------------------------------------------------------
+# Ensure OpenDKIM service account exists.
+#
+# Some distributions create this account in the OpenDKIM package scriptlet,
+# while others may create it differently. Make the package self-sufficient.
+# ---------------------------------------------------------------------------
 
-    if ! grep -Fxq "$start" "$file" 2>/dev/null; then
-        cat "$block_file" >> "$tmp" || { rm -f "$tmp"; return 1; }
-    fi
+if ! getent group opendkim >/dev/null; then
+    echo "[postfix-custom-mailserver] Creating group 'opendkim'..."
+    groupadd --system opendkim
+fi
 
-    cat "$tmp" > "$file"
-    rm -f "$tmp"
-}
+if ! getent passwd opendkim >/dev/null; then
+    echo "[postfix-custom-mailserver] Creating user 'opendkim'..."
+    useradd \
+        --system \
+        --gid opendkim \
+        --home-dir /var/lib/opendkim \
+        --shell /sbin/nologin \
+        opendkim
+fi
 
-apply_postfix() {
-    [ -f "$POSTFIX_MAIN_CF" ] || die "$POSTFIX_MAIN_CF does not exist"
-    backup_once "$POSTFIX_MAIN_CF" "$POSTFIX_BACKUP"
+# ---------------------------------------------------------------------------
+# Directories
+# ---------------------------------------------------------------------------
 
-    local block
-    block=$(mktemp) || return 1
-    cat > "$block" <<'EOB'
-# BEGIN postfix-custom-mailserver
-# Managed by postfix-custom-mailserver RPM. Do not edit this block manually.
-inet_interfaces = all
-inet_protocols = all
-mynetworks = 127.0.0.1/8, [::1]/128
-alias_maps = hash:/etc/aliases
-alias_database = hash:/etc/aliases
-milter_default_action = accept
-milter_protocol = 6
-smtpd_milters = inet:127.0.0.1:8891
-non_smtpd_milters = inet:127.0.0.1:8891
-# END postfix-custom-mailserver
-EOB
+install -d -o opendkim -g opendkim -m 0750 \
+    /var/lib/opendkim
 
-    replace_managed_block "$POSTFIX_MAIN_CF" "$MARKER_START" "$MARKER_END" "$block" || {
-        rm -f "$block"
-        die "failed to update $POSTFIX_MAIN_CF"
-    }
-    rm -f "$block"
+install -d -o opendkim -g opendkim -m 0750 \
+    "${OPENDKIM_DIR}"
 
-    postconf -n >/dev/null || die "Postfix configuration validation failed"
-    postfix check || die "postfix check failed"
-}
+install -d -o opendkim -g opendkim -m 0750 \
+    "${OPENDKIM_KEYS_DIR}"
 
-ensure_opendkim_setting() {
-    local key="$1" value="$2"
-    local file="$OPENDKIM_CONF"
-    local tmp
-    tmp=$(mktemp "${file}.XXXXXX") || return 1
+# ---------------------------------------------------------------------------
+# OpenDKIM configuration
+# ---------------------------------------------------------------------------
 
-    awk -v key="$key" -v value="$value" '
-        BEGIN { done=0 }
-        $0 ~ "^[[:space:]]*#?[[:space:]]*" key "([[:space:]]|$)" {
-            if (!done) { print key "                    " value; done=1 }
-            next
-        }
-        { print }
-        END { if (!done) print key "                    " value }
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+cat > "${OPENDKIM_CONF}" <<'EOF'
+Syslog                  yes
+SyslogSuccess           yes
+LogWhy                  yes
 
-    cat "$tmp" > "$file"
-    rm -f "$tmp"
-}
+UMask                   007
 
-apply_opendkim() {
-    [ -f "$OPENDKIM_CONF" ] || die "$OPENDKIM_CONF does not exist"
-    getent passwd opendkim >/dev/null 2>&1 || die "OpenDKIM user 'opendkim' does not exist"
-    getent group opendkim >/dev/null 2>&1 || die "OpenDKIM group 'opendkim' does not exist"
+Canonicalization        relaxed/simple
+Mode                    sv
+OversignHeaders         From
 
-    backup_once "$OPENDKIM_CONF" "$OPENDKIM_BACKUP"
-    install -d -m 0755 "$OPENDKIM_DIR"
-    touch "$KEY_TABLE" "$SIGNING_TABLE"
-    chmod 0644 "$KEY_TABLE" "$SIGNING_TABLE"
+UserID                  opendkim:opendkim
+PidFile                 /run/opendkim/opendkim.pid
 
-    ensure_opendkim_setting Mode sv
-    ensure_opendkim_setting Socket 'inet:8891@127.0.0.1'
-    ensure_opendkim_setting KeyTable 'refile:/etc/opendkim/KeyTable'
-    ensure_opendkim_setting SigningTable 'refile:/etc/opendkim/SigningTable'
-    ensure_opendkim_setting TrustedHosts 'refile:/etc/opendkim/TrustedHosts'
+Socket                  inet:8891@127.0.0.1
 
-    if [ ! -f "$TRUSTED_HOSTS" ]; then
-        cat > "$TRUSTED_HOSTS" <<'EOT'
+KeyTable                refile:/etc/opendkim/KeyTable
+SigningTable            refile:/etc/opendkim/SigningTable
+TrustedHosts            refile:/etc/opendkim/TrustedHosts
+EOF
+
+cat > "${OPENDKIM_DIR}/KeyTable" <<'EOF'
+# Add DKIM keys here, for example:
+#
+# mail._domainkey.example.com example.com:mail:/etc/opendkim/keys/example.com/mail.private
+EOF
+
+cat > "${OPENDKIM_DIR}/SigningTable" <<'EOF'
+# Add signing rules here, for example:
+#
+# *@example.com mail._domainkey.example.com
+EOF
+
+cat > "${OPENDKIM_DIR}/TrustedHosts" <<'EOF'
 127.0.0.1
 ::1
 localhost
-EOT
-        chmod 0644 "$TRUSTED_HOSTS"
-    else
-        ensure_line() {
-            grep -Fqx "$1" "$TRUSTED_HOSTS" 2>/dev/null || printf '%s\n' "$1" >> "$TRUSTED_HOSTS"
-        }
-        ensure_line 127.0.0.1
-        ensure_line ::1
-        ensure_line localhost
+EOF
+
+chown root:opendkim \
+    "${OPENDKIM_CONF}" \
+    "${OPENDKIM_DIR}/KeyTable" \
+    "${OPENDKIM_DIR}/SigningTable" \
+    "${OPENDKIM_DIR}/TrustedHosts"
+
+chmod 0640 \
+    "${OPENDKIM_CONF}" \
+    "${OPENDKIM_DIR}/KeyTable" \
+    "${OPENDKIM_DIR}/SigningTable" \
+    "${OPENDKIM_DIR}/TrustedHosts"
+
+# ---------------------------------------------------------------------------
+# Postfix configuration
+#
+# IMPORTANT:
+# Always use postconf -e instead of appending to main.cf.
+# This makes installation and re-installation idempotent.
+# ---------------------------------------------------------------------------
+
+postconf -e 'inet_interfaces = all'
+postconf -e 'inet_protocols = all'
+
+postconf -e 'mynetworks = 127.0.0.1/8, [::1]/128'
+
+postconf -e 'smtpd_milters = inet:127.0.0.1:8891'
+postconf -e 'non_smtpd_milters = inet:127.0.0.1:8891'
+
+postconf -e 'milter_protocol = 6'
+postconf -e 'milter_default_action = accept'
+
+postconf -e 'smtpd_tls_security_level = may'
+postconf -e 'smtp_tls_security_level = may'
+
+postconf -e 'smtpd_tls_cert_file = /etc/pki/tls/certs/postfix.pem'
+postconf -e 'smtpd_tls_key_file = /etc/pki/tls/private/postfix.key'
+
+# Keep distribution defaults for aliases unless explicitly configured.
+# We deliberately do not append alias_maps/alias_database.
+
+# ---------------------------------------------------------------------------
+# Permissions
+# ---------------------------------------------------------------------------
+
+if [[ -f /etc/postfix/main.cf ]]; then
+    chmod 0644 /etc/postfix/main.cf
+fi
+
+# ---------------------------------------------------------------------------
+# Validate configuration before restarting services.
+# ---------------------------------------------------------------------------
+
+echo "[postfix-custom-mailserver] Running postfix check..."
+postfix check
+
+echo "[postfix-custom-mailserver] Enabling services..."
+systemctl enable postfix.service
+systemctl enable opendkim.service
+
+echo "[postfix-custom-mailserver] Restarting OpenDKIM..."
+systemctl restart opendkim.service
+
+echo "[postfix-custom-mailserver] Waiting for OpenDKIM listener..."
+
+for _ in {1..20}; do
+    if ss -lnt | grep -q '127\.0\.0\.1:8891'; then
+        break
     fi
 
-    # Only the key directory is recursively owned by OpenDKIM. Do not change
-    # ownership of distro-managed configuration files.
-    install -d -o opendkim -g opendkim -m 0750 "$OPENDKIM_DIR/keys"
-    chown opendkim:opendkim "$KEY_TABLE" "$SIGNING_TABLE" "$TRUSTED_HOSTS"
+    sleep 0.5
+done
 
-    if command -v opendkim-testkey >/dev/null 2>&1; then
-        : # Domain-specific validation is performed by generate-dkim-key.sh.
-    fi
-}
+if ! ss -lnt | grep -q '127\.0\.0\.1:8891'; then
+    echo "ERROR: OpenDKIM failed to listen on 127.0.0.1:8891" >&2
+    systemctl status opendkim.service --no-pager >&2 || true
+    journalctl -u opendkim.service -n 50 --no-pager >&2 || true
+    exit 1
+fi
 
-restart_if_active() {
-    local service="$1"
-    if systemctl is-active --quiet "$service"; then
-        systemctl reload-or-restart "$service" || return 1
-    fi
-}
+echo "[postfix-custom-mailserver] Restarting Postfix..."
+systemctl restart postfix.service
 
-apply() {
-    require_root
-    require_cmds
-    apply_postfix
-    apply_opendkim
+# ---------------------------------------------------------------------------
+# Final checks
+# ---------------------------------------------------------------------------
 
-    restart_if_active postfix.service || die "failed to reload/restart Postfix"
-    restart_if_active opendkim.service || die "failed to reload/restart OpenDKIM"
+if ! systemctl is-active --quiet opendkim.service; then
+    echo "ERROR: OpenDKIM is not running." >&2
+    systemctl status opendkim.service --no-pager >&2 || true
+    exit 1
+fi
 
-    log "configuration applied successfully"
-}
+if ! systemctl is-active --quiet postfix.service; then
+    echo "ERROR: Postfix is not running." >&2
+    systemctl status postfix.service --no-pager >&2 || true
+    exit 1
+fi
 
-show_status() {
-    require_root
-    postfix check
-    if command -v opendkim-testkey >/dev/null 2>&1; then
-        log "OpenDKIM configuration file: $OPENDKIM_CONF"
-    fi
-    systemctl --no-pager --full status postfix.service || true
-    systemctl --no-pager --full status opendkim.service || true
-}
+if ! ss -lnt | grep -q '127\.0\.0\.1:8891'; then
+    echo "ERROR: OpenDKIM listener disappeared after Postfix startup." >&2
+    exit 1
+fi
 
-case "${1:---apply}" in
-    --apply) apply ;;
-    --status) show_status ;;
-    --help|-h)
-        echo "Usage: $0 [--apply|--status]"
-        ;;
-    *) die "unknown option: $1" ;;
-esac
+echo "[postfix-custom-mailserver] configuration applied successfully"

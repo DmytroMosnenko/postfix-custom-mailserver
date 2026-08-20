@@ -50,6 +50,7 @@ exit 0
 %post
 # The configuration helper is deliberately idempotent. It only replaces the
 # package-owned blocks and preserves administrator configuration elsewhere.
+set -e
 if [ -x %{_libexecdir}/%{name}/mailserver-configure.sh ]; then
     %{_libexecdir}/%{name}/mailserver-configure.sh --apply || {
         echo "WARNING: %{name} configuration was not fully applied." >&2
@@ -68,6 +69,9 @@ exit 0
 %preun
 # On package removal, deliberately leave Postfix/OpenDKIM services and all
 # administrator configuration untouched.
+if [[ $1 -eq 0 ]]; then
+    echo "[postfix-custom-mailserver] Package removal requested."
+fi
 exit 0
 
 %postun
