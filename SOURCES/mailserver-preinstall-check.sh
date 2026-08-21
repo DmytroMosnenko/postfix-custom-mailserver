@@ -61,7 +61,8 @@ if [ -f /etc/postfix/main.cf ]; then
     fi
 
     # Check for old-style APPENDED blocks (Gemini/ChatGPT v1 would append, not replace)
-    append_count=$(grep -c "CUSTOM MAILSERVER CONFIGURATION" /etc/postfix/main.cf 2>/dev/null || echo 0)
+    append_count=$(grep -c "CUSTOM MAILSERVER CONFIGURATION" /etc/postfix/main.cf 2>/dev/null) || append_count=0
+    append_count=$(( append_count + 0 ))   # ensure it's a plain integer
     if [ "$append_count" -gt 0 ]; then
         issue "Found $append_count appended configuration block(s) from old install!"
         info "  These must be removed before installing the new RPM."

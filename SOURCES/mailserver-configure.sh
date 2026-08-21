@@ -105,34 +105,108 @@ replace_managed_block() {
 # ---------------------------------------------------------------------------
 # Postfix configuration
 # ---------------------------------------------------------------------------
+
+# The parameters we own. Any uncommented line setting one of these in the
+# upstream default main.cf will conflict with our managed block and produce
+# "overriding earlier entry" warnings on every postfix invocation.
+# We comment them out (not delete them, so the original intent is readable)
+# before inserting our block.
+readonly -a MANAGED_PARAMS=(
+    inet_interfaces
+    inet_protocols
+    mynetworks
+    alias_maps
+    alias_database
+    smtpd_relay_restrictions
+    milter_default_action
+    milter_protocol
+    smtpd_milters
+    non_smtpd_milters
+)
+
+# Comment out any bare (uncommented) occurrence of $key = ... that lives
+# OUTSIDE our managed block. Called before replace_managed_block so the
+# file is clean before we append/replace.
+comment_out_upstream_params() {
+    local file="$1"
+    local tmp
+    tmp=$(mktemp "${file}.XXXXXX") || die "mktemp failed"
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+
+    # Build an awk pattern that matches any of the managed param names
+    # as the first word on an uncommented line, outside our block.
+    local pattern
+    pattern=$(printf '%s|' "${MANAGED_PARAMS[@]}")
+    pattern="${pattern%|}"   # strip trailing pipe
+
+    awk \
+        -v block_start="$BLOCK_START" \
+        -v block_end="$BLOCK_END" \
+        -v pattern="$pattern" '
+        BEGIN { in_block=0 }
+        $0 == block_start { in_block=1; print; next }
+        $0 == block_end   { in_block=0; print; next }
+        in_block          { print; next }
+        # Outside the block: comment out uncommented lines whose first
+        # non-space token exactly matches one of our managed params.
+        {
+            line = $0
+            # Skip blank lines and already-commented lines
+            if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) {
+                print line; next
+            }
+            # Extract first token
+            key = line
+            gsub(/^[[:space:]]+/, "", key)
+            split(key, parts, /[[:space:]]*=|[[:space:]]+/)
+            key = parts[1]
+            # Check against managed params
+            n = split(pattern, plist, /\|/)
+            matched = 0
+            for (i = 1; i <= n; i++) {
+                if (key == plist[i]) { matched=1; break }
+            }
+            if (matched) {
+                print "# [pcm-managed] " line
+            } else {
+                print line
+            }
+        }
+    ' "$file" > "$tmp" \
+        || { rm -f "$tmp"; die "awk failed commenting out upstream params in $file"; }
+
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
 apply_postfix() {
     [ -f "$POSTFIX_MAIN_CF" ] || die "$POSTFIX_MAIN_CF does not exist; is postfix installed?"
     backup_once "$POSTFIX_MAIN_CF" "$POSTFIX_BACKUP"
 
+    # Step 1: comment out any conflicting upstream defaults (outside our block)
+    comment_out_upstream_params "$POSTFIX_MAIN_CF"
+
     local block
     block=$(mktemp) || die "mktemp failed"
 
-    # NOTE: inet_interfaces = loopback-only — we only relay outbound mail from
-    # localhost (Python apps, cron, etc.). This is intentionally NOT "all" to
-    # avoid turning the server into an open relay.
-    # NOTE: smtpd_relay_restrictions ensures we do not relay for strangers.
-    # NOTE: milter is only wired for non_smtpd_milters so locally-submitted
-    # mail from apps gets DKIM-signed, while inbound SMTP does not require
-    # DKIM verification (we are not an inbound MX here).
+    # inet_interfaces = loopback-only: only localhost can relay (Python apps,
+    # cron, etc.). NOT "all" — that would open an external SMTP listener.
+    # smtpd_relay_restrictions: hard-blocks relaying for non-mynetworks hosts.
+    # non_smtpd_milters: signs mail injected via sendmail/pickup (local apps).
     cat > "$block" << 'EOB'
 # BEGIN postfix-custom-mailserver
 # Managed by postfix-custom-mailserver RPM. Do not edit between these markers.
-# To override, add settings BELOW this block or use /etc/postfix/main.cf.d/.
-inet_interfaces        = loopback-only
-inet_protocols         = all
-mynetworks             = 127.0.0.0/8, [::1]/128
-alias_maps             = hash:/etc/aliases
-alias_database         = hash:/etc/aliases
+# To override, add settings BELOW this block.
+inet_interfaces          = loopback-only
+inet_protocols           = all
+mynetworks               = 127.0.0.0/8, [::1]/128
+alias_maps               = hash:/etc/aliases
+alias_database           = hash:/etc/aliases
 smtpd_relay_restrictions = permit_mynetworks, reject
-milter_default_action  = accept
-milter_protocol        = 6
-smtpd_milters          = inet:127.0.0.1:8891
-non_smtpd_milters      = inet:127.0.0.1:8891
+milter_default_action    = accept
+milter_protocol          = 6
+smtpd_milters            = inet:127.0.0.1:8891
+non_smtpd_milters        = inet:127.0.0.1:8891
 # END postfix-custom-mailserver
 EOB
 
@@ -140,7 +214,7 @@ EOB
     rm -f "$block"
 
     postconf -n >/dev/null 2>&1 || die "postconf -n: Postfix configuration is invalid after update"
-    postfix check 2>&1 || die "postfix check: Postfix reports a configuration error"
+    postfix check 2>/dev/null   || die "postfix check: Postfix reports a configuration error"
     log "postfix configuration applied and validated"
 }
 

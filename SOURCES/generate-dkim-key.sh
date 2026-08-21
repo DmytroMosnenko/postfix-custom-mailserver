@@ -101,8 +101,6 @@ chmod 0644 "$KEY_TABLE" "$SIGNING_TABLE"
 # ---------------------------------------------------------------------------
 # Reload services (only if active)
 # ---------------------------------------------------------------------------
-postfix check 2>&1 || { echo "WARNING: postfix check reported issues" >&2; }
-
 if systemctl is-active --quiet opendkim.service; then
     systemctl reload-or-restart opendkim.service \
         && log "opendkim reloaded" \

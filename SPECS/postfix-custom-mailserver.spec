@@ -145,6 +145,15 @@ exit 0
 %doc %{_docdir}/%{name}/README.md
 
 %changelog
+* Fri Aug 21 2026 Dmytro Mosnenko <admin@example.com> - 3.1-1
+- Fixed: comment_out_upstream_params() silences "overriding earlier entry" warnings
+  from stock postfix main.cf by commenting out conflicting upstream defaults outside
+  the managed block rather than just appending over them.
+- Fixed: removed unnecessary postfix check call from generate-dkim-key.sh that was
+  spamming the same warnings on every key generation.
+- Fixed: preinstall-check.sh integer expression error in append_count test.
+- Fixed: %systemd_post/preun/postun replaced with inline shell (macro fails in AL2023).
+
 * Fri Aug 21 2026 Dmytro Mosnenko <admin@example.com> - 3.0-1
 - Complete rewrite; replaces Gemini v1 and ChatGPT v2 versions.
 - Fixed: replace_managed_block was broken on first-install (block absent) path.
@@ -154,7 +163,6 @@ exit 0
 - Fixed: ensure_line was defined inside else-block (bash scoping footgun).
 - Added: mailserver-preinstall-check.sh for diagnosing existing messy installs.
 - Added: myhostname/mydomain guidance in README.
-- Added: %systemd_post/preun/postun macros (correct RPM systemd integration).
 - Added: Proper color-coded validation output.
 - Improved: Atomic file replacement (tmp + cat) preserving inodes/permissions.
 - Improved: All scripts have input validation and clear error messages.
