@@ -15,8 +15,9 @@ Requires:       opendkim
 Requires:       opendkim-tools
 
 # systemd macros for %post/%preun/%postun
-%{?systemd_requires}
-BuildRequires:  systemd-rpm-macros
+Requires(post):   systemd
+Requires(preun):  systemd
+Requires(postun): systemd
 
 %description
 Private production RPM for configuring Postfix as an outbound-only SMTP relay
@@ -81,8 +82,12 @@ fi
 
 # Enable services at boot but do NOT start services that were stopped.
 # A running service gets reloaded by the configure script above.
-%systemd_post postfix.service
-%systemd_post opendkim.service
+# ($1 == 1: fresh install; $1 == 2: upgrade)
+if [ "$1" -ge 1 ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    systemctl enable postfix.service  >/dev/null 2>&1 || :
+    systemctl enable opendkim.service >/dev/null 2>&1 || :
+fi
 
 # Print usage summary
 cat << 'POSTINSTALL'
@@ -116,16 +121,19 @@ POSTINSTALL
 exit 0
 
 %preun
-%systemd_preun postfix.service
-%systemd_preun opendkim.service
-# On full removal ($1 == 0): we do NOT remove /etc/postfix/main.cf,
-# /etc/opendkim.conf, or any DKIM keys. These are administrator data.
-# The managed block in main.cf stays but is clearly marked and harmless.
+# $1 == 0: final removal. $1 == 1: upgrade (do nothing here).
+# We do NOT disable/stop postfix or opendkim on removal — they are
+# infrastructure services the admin controls independently.
+# We do NOT remove main.cf, opendkim.conf, or DKIM keys — admin data.
+if [ "$1" -eq 0 ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
 exit 0
 
 %postun
-%systemd_postun_with_restart postfix.service
-%systemd_postun_with_restart opendkim.service
+# $1 == 0: final removal — nothing to restart.
+# $1 >= 1: upgrade — services were already reloaded by %post configure script.
+systemctl daemon-reload >/dev/null 2>&1 || :
 exit 0
 
 %files
