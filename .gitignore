@@ -4,7 +4,7 @@ build/
 BUILD/
 BUILDROOT/
 RPMS/
-SOURCES/*.tar.gz
+*.tar.gz
 SRPMS/
 
 # Local generated artifacts
@@ -14,5 +14,6 @@ dist/
 
 # Editor / OS files
 .DS_Store
+__MACOSX/
 .idea/
 .vscode/
