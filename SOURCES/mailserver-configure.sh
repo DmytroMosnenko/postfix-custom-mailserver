@@ -280,27 +280,52 @@ EOT
         ensure_line_in_file "localhost" "$TRUSTED_HOSTS"
     fi
 
-    # Write opendkim.conf using a managed block — same strategy as main.cf.
-    # The stock opendkim.conf from the RPM has many commented-out example lines
-    # for Socket, Mode, etc. Patching individual keys in that file is fragile
-    # (matching commented examples, duplicate active lines). Instead we keep
-    # the entire original file for reference but insert one authoritative block.
-    #
-    # Socket notation: OpenDKIM uses inet:PORT@HOST (note: reversed vs Postfix)
+    # Comment out every active (non-comment, non-blank) line in opendkim.conf
+    # that lives OUTSIDE our managed block. The stock conf from the package has
+    # many active settings (Socket, Mode, TrustedHosts, etc.) that conflict with
+    # or duplicate our block -- including parameters unrecognized in opendkim 2.11
+    # (e.g. TrustedHosts) that cause EX_CONFIG / exit 78.
+    # After this pass the original content is preserved as comments for reference;
+    # our managed block becomes the single authoritative source.
+    local tmp_conf
+    tmp_conf=$(mktemp "${OPENDKIM_CONF}.XXXXXX") || die "mktemp failed"
+    chmod --reference="$OPENDKIM_CONF" "$tmp_conf" 2>/dev/null || true
+
+    awk \
+        -v block_start="$BLOCK_START" \
+        -v block_end="$BLOCK_END" '
+        BEGIN { in_block=0 }
+        $0 == block_start { in_block=1; print; next }
+        $0 == block_end   { in_block=0; print; next }
+        in_block          { print; next }
+        /^[[:space:]]*$/  { print; next }
+        /^[[:space:]]*#/  { print; next }
+        { print "## [pcm] " $0 }
+    ' "$OPENDKIM_CONF" > "$tmp_conf" \
+        || { rm -f "$tmp_conf"; die "awk failed neutralising opendkim.conf"; }
+
+    cat "$tmp_conf" > "$OPENDKIM_CONF"
+    rm -f "$tmp_conf"
+
+    # Write the managed block. All operational settings live here.
+    # Socket: OpenDKIM uses inet:PORT@HOST (reversed vs Postfix inet:HOST:PORT)
+    # PidFile omitted: /run/opendkim is created by the systemd RuntimeDirectory=
+    # directive on modern distros; we let the unit handle it.
     local block
     block=$(mktemp) || die "mktemp failed"
     cat > "$block" << 'ODKIM_BLOCK'
 # BEGIN postfix-custom-mailserver
 # Managed by postfix-custom-mailserver RPM. Do not edit between these markers.
-# All operational settings are here; commented lines above are for reference only.
+# All operational settings live here; lines above are neutralised for reference.
 Mode                    sv
 Socket                  inet:8891@127.0.0.1
-PidFile                 /run/opendkim/opendkim.pid
 Syslog                  yes
 SyslogSuccess           yes
 LogWhy                  yes
 UserID                  opendkim:opendkim
 UMask                   007
+Canonicalization        relaxed/relaxed
+OversignHeaders         From
 KeyTable                refile:/etc/opendkim/KeyTable
 SigningTable            refile:/etc/opendkim/SigningTable
 ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
