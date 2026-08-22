@@ -183,25 +183,43 @@ apply_postfix() {
     [ -f "$POSTFIX_MAIN_CF" ] || die "$POSTFIX_MAIN_CF does not exist; is postfix installed?"
     backup_once "$POSTFIX_MAIN_CF" "$POSTFIX_BACKUP"
 
+    # Detect which alias map type this postfix build supports.
+    # AlmaLinux/RHEL 9+ ships postfix without postfix-hash; uses lmdb.
+    # Amazon Linux 2023 ships with hash support. Probe postconf -m.
+    local alias_map_type="lmdb"
+    if postconf -m 2>/dev/null | grep -qx "lmdb"; then
+        alias_map_type="lmdb"
+    elif postconf -m 2>/dev/null | grep -qx "hash"; then
+        alias_map_type="hash"
+    else
+        # Last resort: read what the distro already configured
+        local existing
+        existing=$(grep -E "^alias_maps[[:space:]]*=" "$POSTFIX_MAIN_CF" 2>/dev/null | head -1 | grep -oP '\w+(?=:)' | head -1)
+        alias_map_type="${existing:-lmdb}"
+        warn "could not detect map type via postconf -m; falling back to '$alias_map_type'"
+    fi
+    log "using alias map type: $alias_map_type"
+
     # Step 1: comment out any conflicting upstream defaults (outside our block)
     comment_out_upstream_params "$POSTFIX_MAIN_CF"
 
     local block
     block=$(mktemp) || die "mktemp failed"
 
+    # NOTE: the heredoc delimiter is NOT quoted here so $alias_map_type expands.
     # inet_interfaces = loopback-only: only localhost can relay (Python apps,
     # cron, etc.). NOT "all" — that would open an external SMTP listener.
     # smtpd_relay_restrictions: hard-blocks relaying for non-mynetworks hosts.
     # non_smtpd_milters: signs mail injected via sendmail/pickup (local apps).
-    cat > "$block" << 'EOB'
+    cat > "$block" << EOB
 # BEGIN postfix-custom-mailserver
 # Managed by postfix-custom-mailserver RPM. Do not edit between these markers.
 # To override, add settings BELOW this block.
 inet_interfaces          = loopback-only
 inet_protocols           = all
 mynetworks               = 127.0.0.0/8, [::1]/128
-alias_maps               = hash:/etc/aliases
-alias_database           = hash:/etc/aliases
+alias_maps               = ${alias_map_type}:/etc/aliases
+alias_database           = ${alias_map_type}:/etc/aliases
 smtpd_relay_restrictions = permit_mynetworks, reject
 milter_default_action    = accept
 milter_protocol          = 6
@@ -222,39 +240,6 @@ EOB
 # OpenDKIM configuration
 # ---------------------------------------------------------------------------
 
-# Replace or add a single key=value in opendkim.conf.
-# Matches only lines where the key is followed by whitespace or end-of-line,
-# anchored at the start (comments stripped), to avoid substring matches.
-ensure_opendkim_setting() {
-    local key="$1" value="$2"
-    local tmp
-    tmp=$(mktemp "${OPENDKIM_CONF}.XXXXXX") || die "mktemp failed"
-    chmod --reference="$OPENDKIM_CONF" "$tmp" 2>/dev/null || true
-
-    awk -v key="$key" -v value="$value" '
-        BEGIN { done=0 }
-        # Match: optional leading space/comment, then exactly the key word,
-        # then whitespace or end-of-line.  Use word-boundary logic via
-        # checking that the character after the key is space/tab or end.
-        {
-            stripped = $0
-            gsub(/^[[:space:]]*#?[[:space:]]*/, "", stripped)
-            n = split(stripped, parts, /[[:space:]]+/)
-            if (n >= 1 && parts[1] == key && !done) {
-                print key "\t\t\t" value
-                done = 1
-                next
-            }
-            print
-        }
-        END { if (!done) print key "\t\t\t" value }
-    ' "$OPENDKIM_CONF" > "$tmp" \
-        || { rm -f "$tmp"; die "awk failed updating $OPENDKIM_CONF (key=$key)"; }
-
-    cat "$tmp" > "$OPENDKIM_CONF"
-    rm -f "$tmp"
-}
-
 ensure_line_in_file() {
     local line="$1" file="$2"
     grep -Fqx "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"
@@ -274,25 +259,19 @@ apply_opendkim() {
     install -d -m 0755 "$OPENDKIM_DIR"
     install -d -o opendkim -g opendkim -m 0750 "${OPENDKIM_DIR}/keys"
 
-    # Create table files if absent (touch preserves existing content)
-    [ -f "$KEY_TABLE" ]    || { install -m 0644 /dev/null "$KEY_TABLE";    log "created $KEY_TABLE"; }
-    [ -f "$SIGNING_TABLE" ] || { install -m 0644 /dev/null "$SIGNING_TABLE"; log "created $SIGNING_TABLE"; }
+    # Create table files if absent (never overwrite existing ones — they hold
+    # the admin's domain entries).
+    [ -f "$KEY_TABLE" ]     || { install -o opendkim -g opendkim -m 0644 /dev/null "$KEY_TABLE";     log "created $KEY_TABLE"; }
+    [ -f "$SIGNING_TABLE" ] || { install -o opendkim -g opendkim -m 0644 /dev/null "$SIGNING_TABLE"; log "created $SIGNING_TABLE"; }
 
-    # Apply required settings (idempotent — each replaces/adds its own key)
-    # Socket notation: OpenDKIM uses inet:PORT@HOST (reversed from Postfix inet:HOST:PORT)
-    ensure_opendkim_setting Mode          "sv"
-    ensure_opendkim_setting Socket        "inet:8891@127.0.0.1"
-    ensure_opendkim_setting KeyTable      "refile:/etc/opendkim/KeyTable"
-    ensure_opendkim_setting SigningTable  "refile:/etc/opendkim/SigningTable"
-    ensure_opendkim_setting TrustedHosts  "refile:/etc/opendkim/TrustedHosts"
-
-    # TrustedHosts: create if absent, ensure mandatory entries otherwise
+    # TrustedHosts: create if absent, append mandatory loopback entries otherwise
     if [ ! -f "$TRUSTED_HOSTS" ]; then
         cat > "$TRUSTED_HOSTS" << 'EOT'
 127.0.0.1
 ::1
 localhost
 EOT
+        chown opendkim:opendkim "$TRUSTED_HOSTS"
         chmod 0644 "$TRUSTED_HOSTS"
         log "created $TRUSTED_HOSTS"
     else
@@ -301,7 +280,38 @@ EOT
         ensure_line_in_file "localhost" "$TRUSTED_HOSTS"
     fi
 
-    # Fix ownership on table files (conf dir itself is owned by root)
+    # Write opendkim.conf using a managed block — same strategy as main.cf.
+    # The stock opendkim.conf from the RPM has many commented-out example lines
+    # for Socket, Mode, etc. Patching individual keys in that file is fragile
+    # (matching commented examples, duplicate active lines). Instead we keep
+    # the entire original file for reference but insert one authoritative block.
+    #
+    # Socket notation: OpenDKIM uses inet:PORT@HOST (note: reversed vs Postfix)
+    local block
+    block=$(mktemp) || die "mktemp failed"
+    cat > "$block" << 'ODKIM_BLOCK'
+# BEGIN postfix-custom-mailserver
+# Managed by postfix-custom-mailserver RPM. Do not edit between these markers.
+# All operational settings are here; commented lines above are for reference only.
+Mode                    sv
+Socket                  inet:8891@127.0.0.1
+PidFile                 /run/opendkim/opendkim.pid
+Syslog                  yes
+SyslogSuccess           yes
+LogWhy                  yes
+UserID                  opendkim:opendkim
+UMask                   007
+KeyTable                refile:/etc/opendkim/KeyTable
+SigningTable            refile:/etc/opendkim/SigningTable
+ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
+InternalHosts           refile:/etc/opendkim/TrustedHosts
+# END postfix-custom-mailserver
+ODKIM_BLOCK
+
+    replace_managed_block "$OPENDKIM_CONF" "$block"
+    rm -f "$block"
+
+    # Fix ownership on table files
     chown opendkim:opendkim "$KEY_TABLE" "$SIGNING_TABLE" "$TRUSTED_HOSTS"
     chmod 0644 "$KEY_TABLE" "$SIGNING_TABLE" "$TRUSTED_HOSTS"
 
