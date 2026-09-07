@@ -207,15 +207,13 @@ apply_postfix() {
     block=$(mktemp) || die "mktemp failed"
 
     # NOTE: the heredoc delimiter is NOT quoted here so $alias_map_type expands.
-    # inet_interfaces = loopback-only: only localhost can relay (Python apps,
-    # cron, etc.). NOT "all" — that would open an external SMTP listener.
     # smtpd_relay_restrictions: hard-blocks relaying for non-mynetworks hosts.
     # non_smtpd_milters: signs mail injected via sendmail/pickup (local apps).
     cat > "$block" << EOB
 # BEGIN postfix-custom-mailserver
 # Managed by postfix-custom-mailserver RPM. Do not edit between these markers.
 # To override, add settings BELOW this block.
-inet_interfaces          = loopback-only
+inet_interfaces          = all
 inet_protocols           = all
 mynetworks               = 127.0.0.0/8, [::1]/128
 alias_maps               = ${alias_map_type}:/etc/aliases

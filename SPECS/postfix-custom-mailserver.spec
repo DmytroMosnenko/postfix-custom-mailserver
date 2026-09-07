@@ -13,6 +13,7 @@ Requires:       cyrus-sasl
 Requires:       cyrus-sasl-plain
 Requires:       opendkim
 Requires:       opendkim-tools
+Requires:       python3-certbot-nginx
 
 # systemd macros for %post/%preun/%postun
 Requires(post):   systemd
@@ -78,6 +79,14 @@ if [ -x %{_libexecdir}/%{name}/mailserver-configure.sh ]; then
         echo "  Run manually: %{_libexecdir}/%{name}/mailserver-configure.sh --apply" >&2
         echo "  Then check:   %{_libexecdir}/%{name}/mailserver-validate.sh" >&2
     }
+fi
+
+# SSL Certificate
+if [ "$1" -eq 1 ]; then
+    echo "Performing initial SSL certificate setup..."
+    certbot certonly --webroot -w /usr/share/nginx/html -d mail.dimosense.com --non-interactive --agree-tos --email amidtrader@gmail.com
+else
+    certbot certonly --nginx -d mail.dimosense.com --non-interactive --agree-tos --email amidtrader@gmail.com || :
 fi
 
 # Enable services at boot but do NOT start services that were stopped.
