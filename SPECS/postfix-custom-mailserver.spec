@@ -60,6 +60,8 @@ install -D -m 0755 SOURCES/mailserver-validate.sh \
     %{buildroot}%{_libexecdir}/%{name}/mailserver-validate.sh
 install -D -m 0755 SOURCES/mailserver-preinstall-check.sh \
     %{buildroot}%{_libexecdir}/%{name}/mailserver-preinstall-check.sh
+install -D -m 0755 SOURCES/mailserver-init-config.sh \
+    %{buildroot}%{_libexecdir}/%{name}/mailserver-init-config.sh
 
 install -D -m 0644 README.md \
     %{buildroot}%{_docdir}/%{name}/README.md
@@ -81,12 +83,55 @@ if [ -x %{_libexecdir}/%{name}/mailserver-configure.sh ]; then
     }
 fi
 
-# SSL Certificate
-if [ "$1" -eq 1 ]; then
-    echo "Performing initial SSL certificate setup..."
-    certbot certonly --webroot -w /usr/share/nginx/html -d mail.dimosense.com --non-interactive --agree-tos --email amidtrader@gmail.com
+# SSL Certificate (Let's Encrypt)
+# Site-specific values come from the environment or from the optional, root-owned
+# /etc/postfix-custom-mailserver.conf (never from this package):
+#   PCM_TLS_CERT_NAME  - cert name/domain (default: postfix myhostname, must be an FQDN)
+#   PCM_CERTBOT_EMAIL  - contact email for certbot (required to request a cert)
+PCM_CONF="${PCM_CONF:-/etc/postfix-custom-mailserver.conf}"
+if [ -r "$PCM_CONF" ]; then
+    echo "%{name}: using existing $PCM_CONF"
+elif [ -t 0 ] && [ -t 1 ]; then
+    # Interactive install: ask once and save the answers.
+    %{_libexecdir}/%{name}/mailserver-init-config.sh || :
 else
-    certbot certonly --nginx -d mail.dimosense.com --non-interactive --agree-tos --email amidtrader@gmail.com || :
+    echo "NOTE: %{name}: $PCM_CONF not found (non-interactive install)." >&2
+    echo "  Create it with: %{_libexecdir}/%{name}/mailserver-init-config.sh" >&2
+fi
+if [ -r "$PCM_CONF" ]; then
+    . "$PCM_CONF"
+    echo "%{name}: TLS cert name=${PCM_TLS_CERT_NAME:-<myhostname>} certbot email=${PCM_CERTBOT_EMAIL:-<unset>}"
+fi
+PCM_DOMAIN="${PCM_TLS_CERT_NAME:-$(postconf -h myhostname 2>/dev/null)}"
+case "$PCM_DOMAIN" in
+    *.*) ;;
+    *)   PCM_DOMAIN="" ;;
+esac
+if [ -z "$PCM_DOMAIN" ] || [ -z "${PCM_CERTBOT_EMAIL:-}" ]; then
+    echo "NOTE: %{name}: skipping certbot (set PCM_TLS_CERT_NAME/myhostname to an FQDN and" >&2
+    echo "  PCM_CERTBOT_EMAIL in /etc/postfix-custom-mailserver.conf), then re-run the" >&2
+    echo "  install or: certbot certonly --nginx -d <host> --email <you>" >&2
+elif [ "$1" -eq 1 ]; then
+    echo "Performing initial SSL certificate setup for $PCM_DOMAIN..."
+    certbot certonly --webroot -w /usr/share/nginx/html -d "$PCM_DOMAIN" --non-interactive --agree-tos --email "$PCM_CERTBOT_EMAIL" || \
+        echo "WARNING: %{name}: certbot failed for $PCM_DOMAIN" >&2
+else
+    certbot certonly --nginx -d "$PCM_DOMAIN" --non-interactive --agree-tos --email "$PCM_CERTBOT_EMAIL" || :
+fi
+
+# Postfix only reads its cert at (re)load time: reload it after every renewal.
+install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/postfix-reload.sh << 'HOOK'
+#!/bin/sh
+systemctl reload postfix >/dev/null 2>&1 || :
+HOOK
+chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/postfix-reload.sh
+
+# The configure step above ran before certbot on a fresh install, so the cert
+# did not exist yet. Re-apply (idempotent) so Postfix picks up the LE cert now.
+if [ -x %{_libexecdir}/%{name}/mailserver-configure.sh ]; then
+    %{_libexecdir}/%{name}/mailserver-configure.sh --apply || :
+    systemctl reload postfix >/dev/null 2>&1 || :
 fi
 
 # Enable services at boot but do NOT start services that were stopped.
@@ -151,9 +196,19 @@ exit 0
 %{_libexecdir}/%{name}/add-alias.sh
 %{_libexecdir}/%{name}/mailserver-validate.sh
 %{_libexecdir}/%{name}/mailserver-preinstall-check.sh
+%{_libexecdir}/%{name}/mailserver-init-config.sh
 %doc %{_docdir}/%{name}/README.md
 
 %changelog
+* Mon Oct 19 2026 Dmytro Mosnenko <admin@example.com> - 3.2-1
+- Fixed: Postfix kept serving the self-signed default cert; managed block now sets
+  smtpd_tls_cert_file/key_file to the Let's Encrypt cert (when it exists).
+- Added: certbot deploy hook reloads Postfix after renewal.
+- Added: mailserver-init-config.sh creates the site config interactively (offered by
+  %post on a terminal; otherwise a hint is printed).
+- Changed: certbot domain/email are no longer hardcoded; they come from
+  /etc/postfix-custom-mailserver.conf or the Postfix myhostname.
+
 * Fri Aug 21 2026 Dmytro Mosnenko <admin@example.com> - 3.1-1
 - Fixed: comment_out_upstream_params() silences "overriding earlier entry" warnings
   from stock postfix main.cf by commenting out conflicting upstream defaults outside

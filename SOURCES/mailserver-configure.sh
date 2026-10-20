@@ -111,7 +111,29 @@ replace_managed_block() {
 # "overriding earlier entry" warnings on every postfix invocation.
 # We comment them out (not delete them, so the original intent is readable)
 # before inserting our block.
-readonly -a MANAGED_PARAMS=(
+#
+# TLS: when a Let's Encrypt cert for TLS_CERT_NAME exists, Postfix is pointed at it
+# so inbound SMTP presents a trusted cert instead of the self-signed dummy cert that
+# the postfix package generates at install time (/etc/pki/tls/certs/postfix.pem).
+# The cert name defaults to the server's own Postfix hostname (see README step 2).
+# If the cert is not there yet (fresh install, certbot not run yet) the TLS params are
+# left untouched; re-run --apply after certbot succeeds.
+# Optional site config (root-owned, NOT shipped in the RPM). May define:
+#   PCM_TLS_CERT_NAME=mail.example.com   # certbot cert name; default: postfix myhostname
+#   PCM_CERTBOT_EMAIL=admin@example.com  # used by the RPM %post to request the cert
+PCM_CONF="${PCM_CONF:-/etc/postfix-custom-mailserver.conf}"
+# shellcheck disable=SC1090
+[ -r "$PCM_CONF" ] && . "$PCM_CONF"
+
+_default_tls_name="$(postconf -h myhostname 2>/dev/null || true)"
+case "$_default_tls_name" in *.*) ;; *) _default_tls_name="" ;; esac   # need an FQDN
+readonly TLS_CERT_NAME="${PCM_TLS_CERT_NAME:-$_default_tls_name}"
+readonly TLS_CERT_FILE="/etc/letsencrypt/live/${TLS_CERT_NAME}/fullchain.pem"
+readonly TLS_KEY_FILE="/etc/letsencrypt/live/${TLS_CERT_NAME}/privkey.pem"
+
+tls_cert_available() { [ -n "$TLS_CERT_NAME" ] && [ -r "$TLS_CERT_FILE" ] && [ -r "$TLS_KEY_FILE" ]; }
+
+MANAGED_PARAMS=(
     inet_interfaces
     inet_protocols
     mynetworks
@@ -123,6 +145,10 @@ readonly -a MANAGED_PARAMS=(
     smtpd_milters
     non_smtpd_milters
 )
+
+if tls_cert_available; then
+    MANAGED_PARAMS+=(smtpd_tls_cert_file smtpd_tls_key_file smtpd_tls_security_level)
+fi
 
 # Comment out any bare (uncommented) occurrence of $key = ... that lives
 # OUTSIDE our managed block. Called before replace_managed_block so the
@@ -209,12 +235,22 @@ apply_postfix() {
     # NOTE: the heredoc delimiter is NOT quoted here so $alias_map_type expands.
     # smtpd_relay_restrictions: hard-blocks relaying for non-mynetworks hosts.
     # non_smtpd_milters: signs mail injected via sendmail/pickup (local apps).
+    local tls_lines=""
+    if tls_cert_available; then
+        tls_lines="smtpd_tls_cert_file       = ${TLS_CERT_FILE}
+smtpd_tls_key_file        = ${TLS_KEY_FILE}
+smtpd_tls_security_level  = may"
+    else
+        warn "Let's Encrypt cert for '${TLS_CERT_NAME:-<no FQDN myhostname>}' not found; leaving Postfix TLS settings unchanged"
+        warn "(inbound SMTP will present the self-signed default cert until you re-run --apply)"
+    fi
+
     cat > "$block" << EOB
 # BEGIN postfix-custom-mailserver
 # Managed by postfix-custom-mailserver RPM. Do not edit between these markers.
 # To override, add settings BELOW this block.
 inet_interfaces          = all
-inet_protocols           = all
+inet_protocols           = ipv4
 mynetworks               = 127.0.0.0/8, [::1]/128
 alias_maps               = ${alias_map_type}:/etc/aliases
 alias_database           = ${alias_map_type}:/etc/aliases
@@ -223,6 +259,7 @@ milter_default_action    = accept
 milter_protocol          = 6
 smtpd_milters            = inet:127.0.0.1:8891
 non_smtpd_milters        = inet:127.0.0.1:8891
+${tls_lines}
 # END postfix-custom-mailserver
 EOB
 

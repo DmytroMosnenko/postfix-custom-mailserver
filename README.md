@@ -79,6 +79,22 @@ sudo hostnamectl set-hostname mail.yourdomain.com
 # myorigin   = $mydomain
 ```
 
+#### TLS certificate (Let's Encrypt)
+
+The RPM requests a certificate for your Postfix `myhostname` (must be an FQDN) and
+points Postfix at it. Without it, Postfix serves the self-signed dummy cert created
+by the postfix package. Before installing, create `/etc/postfix-custom-mailserver.conf`
+(root-owned, sourced as shell). On an interactive install the RPM offers to create it
+for you; otherwise run `/usr/libexec/postfix-custom-mailserver/mailserver-init-config.sh`:
+
+```bash
+PCM_CERTBOT_EMAIL=admin@yourdomain.com   # required for certbot
+# PCM_TLS_CERT_NAME=mail.yourdomain.com  # optional; defaults to myhostname
+```
+
+If the file is absent the certbot step is skipped. Re-run
+`mailserver-configure.sh --apply` after the cert exists.
+
 ### 3. Generate DKIM key
 
 ```bash
