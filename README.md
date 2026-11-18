@@ -223,6 +223,8 @@ Run as root, or as the archive user (`sudo -u pcmreply pcm-reply ...`).
 
 ```bash
 pcm-reply --list                          # archived messages, newest first, with 8-char ids
+pcm-reply --show 787a2d52                 # read a message: headers, attachment names, decoded text
+pcm-reply --show "invoice" --latest --raw # full raw source (all headers)
 pcm-reply "invoice 2043" -m "Paid today, thanks."
 pcm-reply from:john --latest --body-file reply.txt
 echo "Thanks!" | pcm-reply 787a2d52       # body from stdin
@@ -238,6 +240,7 @@ of guessing; use an id or `--latest` (newest match).
 |---|---|
 | `-m TEXT`, `--body-file FILE` | Reply text (or pipe it on stdin; `--body-file -` = stdin) |
 | `--list [SELECTOR] [-n N]` | List archived messages instead of replying |
+| `--show SELECTOR [--raw]` | Print the selected message (decoded text and attachment names; `--raw` = raw source) instead of replying |
 | `--latest` | If several messages match, use the newest |
 | `--from ADDR` | Send as this address (default: the alias the mail was sent to) |
 | `--no-quote` | Do not quote the original message |

@@ -13,6 +13,7 @@ text, From = the alias that received the mail) and hands it to the local
 Usage:
   pcm-reply --list [SELECTOR] [-n 20]      show archived messages (newest first)
   pcm-reply --prune [DAYS]                 delete archived mail older than DAYS (default: retention_days, 90)
+  pcm-reply --show SELECTOR [--raw]        read a message (decoded text; --raw = full source)
   pcm-reply SELECTOR -m "Thanks, done."    reply-all
   echo "text" | pcm-reply SELECTOR         body from stdin
   pcm-reply SELECTOR --body-file reply.txt
@@ -140,9 +141,40 @@ def select(entries, selector):
     return [e for e in entries if low in e.sender.lower()]
 
 
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _safe(text):
+    """Drop control characters (e.g. ESC) so a hostile mail cannot drive the terminal."""
+    return CTRL_RE.sub("", text)
+
+
 def _clip(text, width):
-    text = " ".join(text.split())
+    text = " ".join(_safe(text).split())
     return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def show(entry, raw):
+    if raw:
+        sys.stdout.write(_safe(entry.path.read_bytes().decode("utf-8", "replace")))
+        return 0
+    with entry.path.open("rb") as f:
+        orig = BytesParser(policy=policy.default).parse(f)
+    print("ID: %s" % entry.sid)
+    for name in ("From", "Reply-To", "To", "Cc", "Date", "Subject", "Message-ID"):
+        value = _h(orig, name)
+        if value:
+            print("%s: %s" % (name, _safe(" ".join(value.split()))))
+    try:
+        atts = ["%s [%s]" % (_safe(p.get_filename() or "unnamed"), p.get_content_type())
+                for p in orig.iter_attachments()]
+    except Exception:
+        atts = []
+    if atts:
+        print("Attachments: " + ", ".join(atts))
+    print()
+    print(_safe(original_text(orig).replace("\r\n", "\n")).strip() or "(no text content)")
+    return 0
 
 
 def print_table(entries, stream=sys.stdout):
@@ -338,6 +370,8 @@ def main():
     ap.add_argument("selector", nargs="?", help="id / part of subject / from:sender")
     ap.add_argument("-m", "--message", help="reply text")
     ap.add_argument("--body-file", help="read reply text from FILE ('-' = stdin)")
+    ap.add_argument("--show", action="store_true", help="print the selected message instead of replying")
+    ap.add_argument("--raw", action="store_true", help="with --show: print the raw message source")
     ap.add_argument("--list", action="store_true", help="list archived messages instead of replying")
     ap.add_argument("-n", type=int, default=20, help="rows for --list (default 20)")
     ap.add_argument("--latest", action="store_true", help="if several messages match, use the newest")
@@ -369,6 +403,9 @@ def main():
         print_table(matches[:10], stream=sys.stderr)
         return 2
     entry = matches[0]
+
+    if args.show:
+        return show(entry, args.raw)
 
     body = read_body(args)
     with entry.path.open("rb") as f:
