@@ -224,6 +224,7 @@ Run as root, or as the archive user (`sudo -u pcmreply pcm-reply ...`).
 ```bash
 pcm-reply --list                          # archived messages, newest first, with 8-char ids
 pcm-reply --show 787a2d52                 # read a message: headers, attachment names, decoded text
+pcm-reply --import old.eml                # add a message that arrived before setup (see below)
 pcm-reply --show "invoice" --latest --raw # full raw source (all headers)
 pcm-reply "invoice 2043" -m "Paid today, thanks."
 pcm-reply from:john --latest --body-file reply.txt
@@ -240,6 +241,7 @@ of guessing; use an id or `--latest` (newest match).
 |---|---|
 | `-m TEXT`, `--body-file FILE` | Reply text (or pipe it on stdin; `--body-file -` = stdin) |
 | `--list [SELECTOR] [-n N]` | List archived messages instead of replying |
+| `--import FILE` | Add a raw message (`.eml`, or `-` for stdin) to the archive and exit |
 | `--show SELECTOR [--raw]` | Print the selected message (decoded text and attachment names; `--raw` = raw source) instead of replying |
 | `--latest` | If several messages match, use the newest |
 | `--from ADDR` | Send as this address (default: the alias the mail was sent to) |
@@ -257,6 +259,23 @@ of guessing; use an id or `--latest` (newest match).
 - **Subject / threading:** `Re: ...`, with `In-Reply-To` and `References` set, so Gmail and the
   recipients thread it correctly.
 - **Gmail copy:** a Bcc (envelope only) to `gmail`, so the reply shows up in your inbox in the same thread.
+
+### Replying to mail received before setup
+
+Mail that arrived before the archive existed is only in Gmail. Export it from there and import it:
+
+1. In Gmail open the message, **⋮ → Show original → Download original** (an `.eml` file). Do this on the
+   message you want to answer, not on your own earlier reply.
+2. Copy it to the server and import it:
+   ```bash
+   scp ~/Downloads/original.eml server:/tmp/
+   sudo pcm-reply --import /tmp/original.eml      # prints the new id; a message already archived is detected
+   # or paste it directly: sudo pcm-reply --import -   (paste, then Ctrl-D)
+   ```
+3. Reply as usual: `sudo pcm-reply <id> -m "..."` (check first with `--show <id>` or `--dry-run`).
+
+The imported copy is stamped with the import time, not the mail's date, so the prune timer keeps it for the full
+retention period. Delete the `.eml` from `/tmp` afterwards.
 
 ### Configuration: `/etc/pcm-reply.conf`
 

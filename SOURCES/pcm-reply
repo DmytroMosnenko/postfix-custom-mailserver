@@ -14,6 +14,7 @@ Usage:
   pcm-reply --list [SELECTOR] [-n 20]      show archived messages (newest first)
   pcm-reply --prune [DAYS]                 delete archived mail older than DAYS (default: retention_days, 90)
   pcm-reply --show SELECTOR [--raw]        read a message (decoded text; --raw = full source)
+  pcm-reply --import FILE.eml              add an old message (e.g. from Gmail) to the archive; '-' = stdin
   pcm-reply SELECTOR -m "Thanks, done."    reply-all
   echo "text" | pcm-reply SELECTOR         body from stdin
   pcm-reply SELECTOR --body-file reply.txt
@@ -119,10 +120,45 @@ def scan(archive):
             if key in seen:
                 continue
             seen.add(key)
-            sid = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:8]
+            sid = _sid(key)
             out.append(Entry(p, st.st_mtime, mid, sid, _h(h, "subject"), _h(h, "from")))
     out.sort(key=lambda e: e.ts, reverse=True)
     return out
+
+
+def _sid(key):
+    return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def import_message(conf, src):
+    """Add a raw message (Gmail: 'Download original' .eml) to the archive."""
+    data = sys.stdin.buffer.read() if src == "-" else Path(src).read_bytes()
+    if not data.strip():
+        die("input is empty")
+    orig = BytesParser(policy=policy.default).parsebytes(data)
+    if not _h(orig, "from"):
+        die("this does not look like an email (no From: header) — in Gmail use "
+            "'Show original' -> 'Download original'")
+    archive = conf["archive"]
+    mid = _h(orig, "message-id")
+    for e in scan(archive):
+        if mid and e.mid == mid:
+            print("already in the archive: id %s  [%s]" % (e.sid, _clip(e.subject, 60)))
+            return 0
+    new, tmp = archive / "new", archive / "tmp"
+    if not (new.is_dir() and tmp.is_dir() and os.access(str(new), os.W_OK)):
+        die("cannot write to %s — run as root or: sudo -u pcmreply pcm-reply ..." % archive)
+    now = time.time()
+    name = "%d.M%dP%d.import" % (now, int(now * 1e6) % 1000000, os.getpid())
+    tmp_file = tmp / name
+    tmp_file.write_bytes(data)
+    os.chmod(str(tmp_file), 0o600)
+    if os.geteuid() == 0:                      # keep it readable/prunable by the archive user
+        st = archive.stat()
+        os.chown(str(tmp_file), st.st_uid, st.st_gid)
+    os.rename(str(tmp_file), str(new / name))  # mtime = now, so --prune will not drop it at once
+    print("imported as id %s  [%s]" % (_sid(mid or name), _clip(_h(orig, "subject"), 60)))
+    return 0
 
 
 def select(entries, selector):
@@ -372,6 +408,8 @@ def main():
     ap.add_argument("--body-file", help="read reply text from FILE ('-' = stdin)")
     ap.add_argument("--show", action="store_true", help="print the selected message instead of replying")
     ap.add_argument("--raw", action="store_true", help="with --show: print the raw message source")
+    ap.add_argument("--import", dest="import_file", metavar="FILE",
+                    help="add a raw message (.eml, or '-' for stdin) to the archive and exit")
     ap.add_argument("--list", action="store_true", help="list archived messages instead of replying")
     ap.add_argument("-n", type=int, default=20, help="rows for --list (default 20)")
     ap.add_argument("--latest", action="store_true", help="if several messages match, use the newest")
@@ -386,6 +424,9 @@ def main():
     conf = load_conf()
     if args.prune is not None:
         return prune(conf["archive"], conf["retention_days"] if args.prune < 0 else args.prune)
+
+    if args.import_file:
+        return import_message(conf, args.import_file)
 
     entries = scan(conf["archive"])
     if args.list:
