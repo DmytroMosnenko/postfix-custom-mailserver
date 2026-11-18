@@ -178,12 +178,14 @@ All `pcm-reply` settings live in `/etc/postfix-custom-mailserver.conf`, next to 
 | `PCM_REPLY_NAME` | no | Display name on replies. |
 | `PCM_REPLY_RETENTION_DAYS` | no | How long archived mail is kept (default 90). |
 
-**During `dnf install`** (interactive terminal) the installer asks for whatever is still missing
+**During `dnf install`** (from an interactive terminal; dnf redirects scriptlet input and output, so the
+questions are asked on the controlling terminal, `/dev/tty`) the installer asks for whatever is still missing
 via `mailserver-init-config.sh` — it only asks the TLS questions if the cert settings are missing,
 and only the `pcm-reply` questions if those are missing, so an upgrade of an already configured
 server asks nothing. It then runs `pcm-reply-setup.sh --from-conf`.
 
-On a **non-interactive install** (Ansible, cloud-init, `dnf -y` without a terminal) nothing can be asked.
+On a **non-interactive install** (Ansible, cloud-init, `ssh host dnf install` without `-t`, or with
+`PCM_NONINTERACTIVE=1` set) nothing can be asked.
 The installer then prints which settings are missing and the commands to finish:
 
 ```bash

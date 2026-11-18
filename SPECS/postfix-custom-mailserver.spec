@@ -110,10 +110,22 @@ fi
 #   PCM_CERTBOT_EMAIL  - contact email for certbot (required to request a cert)
 PCM_CONF="${PCM_CONF:-/etc/postfix-custom-mailserver.conf}"
 # The same file also holds the pcm-reply settings (PCM_REPLY_GMAIL, PCM_REPLY_DOMAINS, ...).
-if [ -t 0 ] && [ -t 1 ]; then
+# dnf redirects scriptlet stdin/stdout, so also accept the controlling terminal (/dev/tty).
+# PCM_NONINTERACTIVE=1 in the environment forces the non-interactive path.
+pcm_tty=""
+if [ -z "${PCM_NONINTERACTIVE:-}" ]; then
+    if [ -t 0 ] && [ -t 1 ]; then
+        pcm_tty=direct
+    elif ( : </dev/tty >/dev/tty ) 2>/dev/null; then
+        pcm_tty=devtty
+    fi
+fi
+if [ "$pcm_tty" = direct ]; then
     # Interactive install: ask only for what is still missing (TLS cert, pcm-reply) and save it.
     # Does nothing when the file is already complete (e.g. on upgrade).
     %{_libexecdir}/%{name}/mailserver-init-config.sh || :
+elif [ "$pcm_tty" = devtty ]; then
+    %{_libexecdir}/%{name}/mailserver-init-config.sh </dev/tty >/dev/tty 2>&1 || :
 else
     pcm_missing="$(%{_libexecdir}/%{name}/mailserver-init-config.sh --check 2>/dev/null)" || {
         echo "NOTE: %{name}: non-interactive install, $PCM_CONF is missing:${pcm_missing:- everything}" >&2
@@ -271,6 +283,8 @@ exit 0
 - Added: pcm-reply-prune.service/.timer — daily pruning of archived mail older than
   retention_days (default 90); enabled in %%post, removed with the package.
 - Changed: removing the package unsets recipient_bcc_maps if it is still the pcm-reply value.
+- Fixed: %%post asks its questions on /dev/tty when dnf redirects scriptlet stdin/stdout
+  (PCM_NONINTERACTIVE=1 skips them).
 - Fixed: Version header was still 3.0 while the changelog was already at 3.2.
 - Fixed: spec defines %%{_unitdir} itself when systemd-rpm-macros is not installed in the build environment.
 
