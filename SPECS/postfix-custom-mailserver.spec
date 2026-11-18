@@ -1,3 +1,6 @@
+# The _unitdir macro comes from systemd-rpm-macros; fall back so the spec also builds where it is not installed.
+%{!?_unitdir: %global _unitdir %{_prefix}/lib/systemd/system}
+
 Name:           postfix-custom-mailserver
 Version:        3.3
 Release:        1%{?dist}
@@ -269,6 +272,7 @@ exit 0
   retention_days (default 90); enabled in %post, removed with the package.
 - Changed: removing the package unsets recipient_bcc_maps if it is still the pcm-reply value.
 - Fixed: Version header was still 3.0 while the changelog was already at 3.2.
+- Fixed: spec defines %{_unitdir} itself when systemd-rpm-macros is not installed in the build environment.
 
 * Mon Oct 19 2026 Dmytro Mosnenko <admin@example.com> - 3.2-1
 - Fixed: Postfix kept serving the self-signed default cert; managed block now sets
