@@ -19,7 +19,7 @@ Requires:       opendkim-tools
 Requires:       python3
 Requires:       python3-certbot-nginx
 
-# systemd macros for %post/%preun/%postun
+# systemd macros for %%post/%%preun/%%postun
 Requires(post):   systemd
 Requires(post):   shadow-utils
 Requires(preun):  systemd
@@ -240,7 +240,7 @@ exit 0
 
 %postun
 # $1 == 0: final removal — nothing to restart.
-# $1 >= 1: upgrade — services were already reloaded by %post configure script.
+# $1 >= 1: upgrade — services were already reloaded by %%post configure script.
 systemctl daemon-reload >/dev/null 2>&1 || :
 exit 0
 
@@ -262,17 +262,17 @@ exit 0
 - Added: pcm-reply (/usr/bin/pcm-reply) — reply-all from the server to mail that arrived
   through an alias; finds the original in a private Maildir archive (user pcmreply).
 - Added: pcm-reply-setup.sh creates the archive user/Maildir, the recipient_bcc_maps regexp map
-  and /etc/pcm-reply.conf, then runs a delivery self-test. %post runs it with --from-conf
+  and /etc/pcm-reply.conf, then runs a delivery self-test. %%post runs it with --from-conf
   (PCM_REPLY_GMAIL / PCM_REPLY_DOMAINS in /etc/postfix-custom-mailserver.conf); skipped if unset.
 - Changed: mailserver-init-config.sh now completes the config file instead of only creating it:
   it asks only for missing settings (TLS cert + pcm-reply), keeps other lines, and has --reply,
-  --force and --check (lists missing settings). %post uses it interactively, or prints the
+  --force and --check (lists missing settings). %%post uses it interactively, or prints the
   exact commands to run on a non-interactive install.
 - Added: pcm-reply-prune.service/.timer — daily pruning of archived mail older than
-  retention_days (default 90); enabled in %post, removed with the package.
+  retention_days (default 90); enabled in %%post, removed with the package.
 - Changed: removing the package unsets recipient_bcc_maps if it is still the pcm-reply value.
 - Fixed: Version header was still 3.0 while the changelog was already at 3.2.
-- Fixed: spec defines %{_unitdir} itself when systemd-rpm-macros is not installed in the build environment.
+- Fixed: spec defines %%{_unitdir} itself when systemd-rpm-macros is not installed in the build environment.
 
 * Mon Oct 19 2026 Dmytro Mosnenko <admin@example.com> - 3.2-1
 - Fixed: Postfix kept serving the self-signed default cert; managed block now sets
@@ -290,7 +290,7 @@ exit 0
 - Fixed: removed unnecessary postfix check call from generate-dkim-key.sh that was
   spamming the same warnings on every key generation.
 - Fixed: preinstall-check.sh integer expression error in append_count test.
-- Fixed: %systemd_post/preun/postun replaced with inline shell (macro fails in AL2023).
+- Fixed: %%systemd_post/preun/postun replaced with inline shell (macro fails in AL2023).
 
 * Fri Aug 21 2026 Dmytro Mosnenko <admin@example.com> - 3.0-1
 - Complete rewrite; replaces Gemini v1 and ChatGPT v2 versions.
