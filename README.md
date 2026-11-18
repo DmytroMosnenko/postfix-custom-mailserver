@@ -9,7 +9,8 @@ for application mail, with OpenDKIM signing.
 
 ## What this package does
 
-Installs five helper scripts under `/usr/libexec/postfix-custom-mailserver/`:
+Installs helper scripts under `/usr/libexec/postfix-custom-mailserver/`, plus the
+`pcm-reply` tool in `/usr/bin` (see [Replying from the server](#replying-from-the-server-pcm-reply)):
 
 | Script | Purpose |
 |---|---|
@@ -18,6 +19,10 @@ Installs five helper scripts under `/usr/libexec/postfix-custom-mailserver/`:
 | `add-alias.sh` | Safely add `/etc/aliases` entries |
 | `mailserver-validate.sh` | Full health check with colored output |
 | `mailserver-preinstall-check.sh` | Diagnose existing state before install |
+| `mailserver-init-config.sh` | Interactively create/complete `/etc/postfix-custom-mailserver.conf` (TLS + pcm-reply settings) |
+| `pcm-reply-setup.sh` | Enable the server-side mail archive used by `pcm-reply` |
+| `/usr/bin/pcm-reply` | Reply-all from the server to mail that arrived through an alias |
+| `pcm-reply-prune.timer` | Daily pruning of the archive (systemd timer, not a script) |
 
 After install, the `%post` scriptlet runs `mailserver-configure.sh --apply`
 automatically.
@@ -58,7 +63,7 @@ Everything outside the marked block is **preserved**.
 sudo /usr/libexec/postfix-custom-mailserver/mailserver-preinstall-check.sh
 
 # Install or upgrade:
-sudo dnf install ./postfix-custom-mailserver-3.0-1.noarch.rpm
+sudo dnf install ./postfix-custom-mailserver-3.3-1.noarch.rpm
 ```
 
 ### 2. Set your server's hostname (important for DKIM)
@@ -85,7 +90,8 @@ The RPM requests a certificate for your Postfix `myhostname` (must be an FQDN) a
 points Postfix at it. Without it, Postfix serves the self-signed dummy cert created
 by the postfix package. Before installing, create `/etc/postfix-custom-mailserver.conf`
 (root-owned, sourced as shell). On an interactive install the RPM offers to create it
-for you; otherwise run `/usr/libexec/postfix-custom-mailserver/mailserver-init-config.sh`:
+for you (and also asks for the `pcm-reply` settings, see below); otherwise run
+`/usr/libexec/postfix-custom-mailserver/mailserver-init-config.sh`:
 
 ```bash
 PCM_CERTBOT_EMAIL=admin@yourdomain.com   # required for certbot
@@ -152,6 +158,143 @@ _dmarc.yourdomain.com  TXT  "v=DMARC1; p=none; rua=mailto:dmarc@yourdomain.com"
 
 ---
 
+## Replying from the server (pcm-reply)
+
+Aliases forward incoming mail to your Gmail, so the server itself has no copy of it.
+`pcm-reply` fixes that: Postfix keeps a private Maildir copy of everything addressed
+to your domains, and `pcm-reply` finds the original there, builds a proper **reply-all**
+and sends it through the local `sendmail` (so OpenDKIM signs it like any other mail).
+You only give it a hint (id, subject or sender) and your text.
+
+### Setup
+
+All `pcm-reply` settings live in `/etc/postfix-custom-mailserver.conf`, next to the TLS settings:
+
+| Variable | Required | What it is used for |
+|---|---|---|
+| `PCM_REPLY_GMAIL` | yes | Your real mailbox (the alias target). Removed from reply-all recipients, and gets a Bcc copy of every reply so it shows up threaded in your inbox. |
+| `PCM_REPLY_DOMAINS` | yes | Your mail domains (space separated). Mail addressed to them is archived on the server; addresses in these domains count as "you" (removed from recipients, and used as the From of replies). |
+| `PCM_REPLY_DEFAULT_FROM` | no | From address when no own-domain address is in To/Cc (mail that reached you by Bcc). |
+| `PCM_REPLY_NAME` | no | Display name on replies. |
+| `PCM_REPLY_RETENTION_DAYS` | no | How long archived mail is kept (default 90). |
+
+**During `dnf install`** (interactive terminal) the installer asks for whatever is still missing
+via `mailserver-init-config.sh` — it only asks the TLS questions if the cert settings are missing,
+and only the `pcm-reply` questions if those are missing, so an upgrade of an already configured
+server asks nothing. It then runs `pcm-reply-setup.sh --from-conf`.
+
+On a **non-interactive install** (Ansible, cloud-init, `dnf -y` without a terminal) nothing can be asked.
+The installer then prints which settings are missing and the commands to finish:
+
+```bash
+sudo /usr/libexec/postfix-custom-mailserver/mailserver-init-config.sh --reply   # asks only the pcm-reply questions
+sudo /usr/libexec/postfix-custom-mailserver/pcm-reply-setup.sh --from-conf      # applies them
+```
+
+You can also edit the file by hand (shell syntax) instead of answering questions:
+
+```bash
+PCM_REPLY_GMAIL=you@gmail.com
+PCM_REPLY_DOMAINS="yourdomain.com other.org"
+# PCM_REPLY_DEFAULT_FROM=support@yourdomain.com
+# PCM_REPLY_NAME="Your Name"
+# PCM_REPLY_RETENTION_DAYS=90
+```
+
+`mailserver-init-config.sh --check` lists missing settings without asking anything,
+`--force` asks everything again (current values are offered as defaults).
+`pcm-reply-setup.sh` can also be run with explicit arguments, without the conf file:
+
+```bash
+sudo /usr/libexec/postfix-custom-mailserver/pcm-reply-setup.sh \
+    --gmail you@gmail.com --default-from support@yourdomain.com yourdomain.com
+```
+
+The script is idempotent. It creates the system user `pcmreply` (home `/home/pcmreply`,
+Maildir inside, mode 0700), sets `recipient_bcc_maps = regexp:/etc/postfix/pcm_archive_bcc`
+in `main.cf`, writes `/etc/pcm-reply.conf`, reloads Postfix and runs a delivery self-test.
+It refuses to overwrite a `recipient_bcc_maps` you already use for something else.
+
+### Usage
+
+Run as root, or as the archive user (`sudo -u pcmreply pcm-reply ...`).
+
+```bash
+pcm-reply --list                          # archived messages, newest first, with 8-char ids
+pcm-reply "invoice 2043" -m "Paid today, thanks."
+pcm-reply from:john --latest --body-file reply.txt
+echo "Thanks!" | pcm-reply 787a2d52       # body from stdin
+pcm-reply "invoice" -m "..." --dry-run    # print the reply, do not send
+```
+
+**SELECTOR** is an 8-char id from `--list`, a full Message-ID, a piece of the subject, or
+`from:<piece of the sender>` (a bare word that matches no subject falls back to sender
+search). If several messages match, `pcm-reply` lists them and exits with status 2 instead
+of guessing; use an id or `--latest` (newest match).
+
+| Option | Meaning |
+|---|---|
+| `-m TEXT`, `--body-file FILE` | Reply text (or pipe it on stdin; `--body-file -` = stdin) |
+| `--list [SELECTOR] [-n N]` | List archived messages instead of replying |
+| `--latest` | If several messages match, use the newest |
+| `--from ADDR` | Send as this address (default: the alias the mail was sent to) |
+| `--no-quote` | Do not quote the original message |
+| `--no-copy` | Do not Bcc a copy to your Gmail |
+| `--dry-run` | Print the reply and envelope, send nothing |
+| `--prune [DAYS]` | Delete archived mail older than DAYS (default: `retention_days`) and exit |
+
+**What a reply looks like**
+
+- **To:** original Reply-To (else From) plus the original To; **Cc:** the original Cc. Your own-domain
+  addresses and your Gmail are removed. If nobody is left (e.g. a contact form that sends *from* your
+  own domain without Reply-To), it stops with an error.
+- **From:** the own-domain address the mail was sent to (`--from` overrides, `default_from` is the fallback).
+- **Subject / threading:** `Re: ...`, with `In-Reply-To` and `References` set, so Gmail and the
+  recipients thread it correctly.
+- **Gmail copy:** a Bcc (envelope only) to `gmail`, so the reply shows up in your inbox in the same thread.
+
+### Configuration: `/etc/pcm-reply.conf`
+
+Generated by `pcm-reply-setup.sh` (re-run it to change values):
+
+```ini
+[reply]
+archive_dir    = /home/pcmreply/Maildir
+own_domains    = yourdomain.com,other.org
+gmail          = you@gmail.com
+default_from   = support@yourdomain.com
+from_name      = Your Name
+retention_days = 90
+```
+
+### Archive retention
+
+`pcm-reply-prune.timer` runs `pcm-reply --prune` daily (as `pcmreply`, sandboxed) and deletes
+archived mail older than `retention_days`. It is enabled by the package; the service does nothing
+until the archive exists.
+
+```bash
+systemctl list-timers pcm-reply-prune.timer
+systemctl start pcm-reply-prune.service   # run now
+journalctl -u pcm-reply-prune.service
+```
+
+### Notes and limitations
+
+- Only mail received **after** setup can be replied to; older mail exists only in Gmail.
+- The archive holds a copy of *all* incoming mail for the configured domains (spam included),
+  readable only by root and `pcmreply`. Keep `retention_days` as short as you can live with.
+- If the archive mailbox cannot accept mail (disk full, wrong permissions, SELinux denial), Postfix
+  bounces that copy to the sender even though the Gmail forward still works. If `pcm-reply-setup.sh`
+  reports that the self-test message did not arrive, check `postqueue -p`, `journalctl -u postfix`
+  and `ausearch -m avc -ts recent`.
+- Removing the package unsets `recipient_bcc_maps` (if it still has the pcm-reply value) so the archive
+  stops growing. `/home/pcmreply` and `/etc/pcm-reply.conf` are left in place; delete them by hand
+  if you want the archived mail gone.
+- Requires Python 3.6+ (standard library only).
+
+---
+
 ## Installing over an existing broken setup
 
 The package is designed to be installed directly over a broken previous
@@ -185,7 +328,7 @@ sudo dnf install -y rpm-build rpmdevtools systemd-rpm-macros
 rpmdev-setuptree
 
 # Create the source tarball
-VERSION=3.0
+VERSION=3.3
 tar -czf ~/rpmbuild/SOURCES/postfix-custom-mailserver-${VERSION}.tar.gz \
     --exclude='.git' \
     --exclude='.github' \
@@ -202,4 +345,4 @@ rpmbuild -ba ~/rpmbuild/SPECS/postfix-custom-mailserver.spec
 ls ~/rpmbuild/RPMS/noarch/
 ```
 
-Or use the GitHub Actions workflow (push a `v3.0` tag).
+Or use the GitHub Actions workflow (push a `v3.3` tag).

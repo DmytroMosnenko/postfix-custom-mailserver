@@ -1,5 +1,5 @@
 Name:           postfix-custom-mailserver
-Version:        3.0
+Version:        3.3
 Release:        1%{?dist}
 Summary:        Idempotent Postfix + OpenDKIM setup for outbound application mail
 License:        MIT
@@ -13,10 +13,12 @@ Requires:       cyrus-sasl
 Requires:       cyrus-sasl-plain
 Requires:       opendkim
 Requires:       opendkim-tools
+Requires:       python3
 Requires:       python3-certbot-nginx
 
 # systemd macros for %post/%preun/%postun
 Requires(post):   systemd
+Requires(post):   shadow-utils
 Requires(preun):  systemd
 Requires(postun): systemd
 
@@ -31,6 +33,11 @@ The package installs idempotent administration helpers:
   add-alias.sh              — safely add /etc/aliases entries
   mailserver-validate.sh    — verify the full setup
   mailserver-preinstall-check.sh — diagnose existing state before install
+  pcm-reply-setup.sh        — enable the server-side reply archive (used by pcm-reply)
+
+It also installs pcm-reply (/usr/bin/pcm-reply): reply-all from the server to mail
+that arrived through an alias, plus a systemd timer (pcm-reply-prune.timer) that
+deletes archived mail older than the configured retention.
 
 Configuration strategy:
   - Postfix main.cf: only a clearly-marked managed block is touched.
@@ -63,6 +70,16 @@ install -D -m 0755 SOURCES/mailserver-preinstall-check.sh \
 install -D -m 0755 SOURCES/mailserver-init-config.sh \
     %{buildroot}%{_libexecdir}/%{name}/mailserver-init-config.sh
 
+install -D -m 0755 SOURCES/pcm-reply-setup.sh \
+    %{buildroot}%{_libexecdir}/%{name}/pcm-reply-setup.sh
+
+install -D -m 0755 SOURCES/pcm-reply \
+    %{buildroot}%{_bindir}/pcm-reply
+install -D -m 0644 SOURCES/pcm-reply-prune.service \
+    %{buildroot}%{_unitdir}/pcm-reply-prune.service
+install -D -m 0644 SOURCES/pcm-reply-prune.timer \
+    %{buildroot}%{_unitdir}/pcm-reply-prune.timer
+
 install -D -m 0644 README.md \
     %{buildroot}%{_docdir}/%{name}/README.md
 
@@ -89,14 +106,17 @@ fi
 #   PCM_TLS_CERT_NAME  - cert name/domain (default: postfix myhostname, must be an FQDN)
 #   PCM_CERTBOT_EMAIL  - contact email for certbot (required to request a cert)
 PCM_CONF="${PCM_CONF:-/etc/postfix-custom-mailserver.conf}"
-if [ -r "$PCM_CONF" ]; then
-    echo "%{name}: using existing $PCM_CONF"
-elif [ -t 0 ] && [ -t 1 ]; then
-    # Interactive install: ask once and save the answers.
+# The same file also holds the pcm-reply settings (PCM_REPLY_GMAIL, PCM_REPLY_DOMAINS, ...).
+if [ -t 0 ] && [ -t 1 ]; then
+    # Interactive install: ask only for what is still missing (TLS cert, pcm-reply) and save it.
+    # Does nothing when the file is already complete (e.g. on upgrade).
     %{_libexecdir}/%{name}/mailserver-init-config.sh || :
 else
-    echo "NOTE: %{name}: $PCM_CONF not found (non-interactive install)." >&2
-    echo "  Create it with: %{_libexecdir}/%{name}/mailserver-init-config.sh" >&2
+    pcm_missing="$(%{_libexecdir}/%{name}/mailserver-init-config.sh --check 2>/dev/null)" || {
+        echo "NOTE: %{name}: non-interactive install, $PCM_CONF is missing:${pcm_missing:- everything}" >&2
+        echo "  Complete it interactively with: %{_libexecdir}/%{name}/mailserver-init-config.sh" >&2
+        echo "  then apply pcm-reply:           %{_libexecdir}/%{name}/pcm-reply-setup.sh --from-conf" >&2
+    }
 fi
 if [ -r "$PCM_CONF" ]; then
     . "$PCM_CONF"
@@ -134,6 +154,18 @@ if [ -x %{_libexecdir}/%{name}/mailserver-configure.sh ]; then
     systemctl reload postfix >/dev/null 2>&1 || :
 fi
 
+# pcm-reply: archive a private copy of incoming mail so replies can be sent from this server.
+# Values come from $PCM_CONF (collected by mailserver-init-config.sh above):
+#   PCM_REPLY_GMAIL, PCM_REPLY_DOMAINS (required), PCM_REPLY_DEFAULT_FROM, PCM_REPLY_NAME,
+#   PCM_REPLY_RETENTION_DAYS (optional). Without the two required ones this step is skipped
+#   (the NOTE above already told the admin what to run).
+if [ -x %{_libexecdir}/%{name}/pcm-reply-setup.sh ]; then
+    %{_libexecdir}/%{name}/pcm-reply-setup.sh --from-conf || {
+        echo "WARNING: %{name}: pcm-reply setup had errors." >&2
+        echo "  Run manually: %{_libexecdir}/%{name}/pcm-reply-setup.sh --help" >&2
+    }
+fi
+
 # Enable services at boot but do NOT start services that were stopped.
 # A running service gets reloaded by the configure script above.
 # ($1 == 1: fresh install; $1 == 2: upgrade)
@@ -141,6 +173,9 @@ if [ "$1" -ge 1 ]; then
     systemctl daemon-reload >/dev/null 2>&1 || :
     systemctl enable postfix.service  >/dev/null 2>&1 || :
     systemctl enable opendkim.service >/dev/null 2>&1 || :
+    # The prune timer is ours, so it is also started; the service itself is a no-op
+    # until pcm-reply-setup.sh has created the archive.
+    systemctl enable --now pcm-reply-prune.timer >/dev/null 2>&1 || :
 fi
 
 # Print usage summary
@@ -166,6 +201,13 @@ cat << 'POSTINSTALL'
    5. Test outbound mail:
         echo "Test from $(hostname)" | mail -s "Test" you@gmail.com
 
+   6. Reply from the server to mail that arrived through an alias:
+        (if not asked during install: run
+           %{_libexecdir}/%{name}/mailserver-init-config.sh --reply
+           %{_libexecdir}/%{name}/pcm-reply-setup.sh --from-conf)
+        pcm-reply --list
+        pcm-reply "invoice 2043" -m "Paid today, thanks."
+
  NOTE: inet_interfaces = loopback-only (only localhost can relay).
  Postfix does NOT listen on external interfaces. This is intentional.
 ========================================================================
@@ -180,6 +222,15 @@ exit 0
 # infrastructure services the admin controls independently.
 # We do NOT remove main.cf, opendkim.conf, or DKIM keys — admin data.
 if [ "$1" -eq 0 ]; then
+    # Our own timer goes away with the package.
+    systemctl disable --now pcm-reply-prune.timer >/dev/null 2>&1 || :
+    # Stop archiving incoming mail: without the prune timer the archive would grow forever.
+    # Only touched if it is still the value pcm-reply-setup.sh wrote. Existing archive
+    # data (/home/pcmreply) and /etc/pcm-reply.conf are left in place.
+    if [ "$(postconf -h recipient_bcc_maps 2>/dev/null)" = "regexp:/etc/postfix/pcm_archive_bcc" ]; then
+        postconf -X recipient_bcc_maps >/dev/null 2>&1 && \
+            { systemctl reload postfix.service >/dev/null 2>&1 || :; }
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 exit 0
@@ -197,9 +248,28 @@ exit 0
 %{_libexecdir}/%{name}/mailserver-validate.sh
 %{_libexecdir}/%{name}/mailserver-preinstall-check.sh
 %{_libexecdir}/%{name}/mailserver-init-config.sh
+%{_libexecdir}/%{name}/pcm-reply-setup.sh
+%{_bindir}/pcm-reply
+%{_unitdir}/pcm-reply-prune.service
+%{_unitdir}/pcm-reply-prune.timer
 %doc %{_docdir}/%{name}/README.md
 
 %changelog
+* Wed Nov 18 2026 Dmytro Mosnenko <admin@example.com> - 3.3-1
+- Added: pcm-reply (/usr/bin/pcm-reply) — reply-all from the server to mail that arrived
+  through an alias; finds the original in a private Maildir archive (user pcmreply).
+- Added: pcm-reply-setup.sh creates the archive user/Maildir, the recipient_bcc_maps regexp map
+  and /etc/pcm-reply.conf, then runs a delivery self-test. %post runs it with --from-conf
+  (PCM_REPLY_GMAIL / PCM_REPLY_DOMAINS in /etc/postfix-custom-mailserver.conf); skipped if unset.
+- Changed: mailserver-init-config.sh now completes the config file instead of only creating it:
+  it asks only for missing settings (TLS cert + pcm-reply), keeps other lines, and has --reply,
+  --force and --check (lists missing settings). %post uses it interactively, or prints the
+  exact commands to run on a non-interactive install.
+- Added: pcm-reply-prune.service/.timer — daily pruning of archived mail older than
+  retention_days (default 90); enabled in %post, removed with the package.
+- Changed: removing the package unsets recipient_bcc_maps if it is still the pcm-reply value.
+- Fixed: Version header was still 3.0 while the changelog was already at 3.2.
+
 * Mon Oct 19 2026 Dmytro Mosnenko <admin@example.com> - 3.2-1
 - Fixed: Postfix kept serving the self-signed default cert; managed block now sets
   smtpd_tls_cert_file/key_file to the Let's Encrypt cert (when it exists).

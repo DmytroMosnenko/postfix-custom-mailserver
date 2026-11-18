@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+pcm-reply — reply-all, from the server, to a message that arrived through a
+Postfix alias. Part of postfix-custom-mailserver.
+
+Postfix only forwards incoming mail to Gmail, so the server has no copy of it.
+pcm-reply-setup.sh makes Postfix keep a private Maildir copy of everything
+addressed to your domains; this tool finds the message in that archive, builds
+a proper reply-all (recipients, Re: subject, In-Reply-To/References, quoted
+text, From = the alias that received the mail) and hands it to the local
+`sendmail`, so OpenDKIM signs it like any other outgoing mail.
+
+Usage:
+  pcm-reply --list [SELECTOR] [-n 20]      show archived messages (newest first)
+  pcm-reply --prune [DAYS]                 delete archived mail older than DAYS (default: retention_days, 90)
+  pcm-reply SELECTOR -m "Thanks, done."    reply-all
+  echo "text" | pcm-reply SELECTOR         body from stdin
+  pcm-reply SELECTOR --body-file reply.txt
+
+SELECTOR is any of:
+  - the 8-char id shown by --list, or a full Message-ID
+  - a piece of the subject
+  - from:<piece of the sender>   (a bare word falls back to sender search too)
+
+Needs Python 3.6+, standard library only. Run as root or as the archive user:
+  sudo pcm-reply ...        sudo -u pcmreply pcm-reply ...
+"""
+import argparse
+import configparser
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from email import policy
+from email.message import EmailMessage
+from email.parser import BytesHeaderParser, BytesParser
+from email.utils import (formataddr, formatdate, getaddresses, make_msgid,
+                         parsedate_to_datetime)
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import List, NamedTuple, Tuple
+
+CONF_PATH = os.environ.get("PCM_REPLY_CONF", "/etc/pcm-reply.conf")
+SENDMAIL = os.environ.get("PCM_REPLY_SENDMAIL") or shutil.which("sendmail") or "/usr/sbin/sendmail"
+MAX_QUOTE_LINES = 200
+MSGID_RE = re.compile(r"^<[^<>\s]+>$")
+RE_PREFIX = re.compile(r"^\s*(re|aw|sv|odp)\s*:", re.I)
+
+
+def die(msg, code=1):
+    print("pcm-reply: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+def _split(value):
+    return [x.strip().lower() for x in re.split(r"[,;\s]+", value) if x.strip()]
+
+
+def load_conf():
+    cp = configparser.ConfigParser(interpolation=None)
+    if not cp.read(CONF_PATH):
+        die("config %s not found — run pcm-reply-setup.sh first" % CONF_PATH)
+    s = cp["reply"] if cp.has_section("reply") else {}
+    get = lambda k, d="": (s.get(k, d) if s else d).strip()
+    return {
+        "archive": Path(get("archive_dir", "/home/pcmreply/Maildir")),
+        "domains": set(_split(get("own_domains"))),
+        "gmail": get("gmail").lower(),            # your real mailbox: dropped from recipients, gets a copy
+        "default_from": get("default_from"),      # used when no own address is found in To/Cc
+        "from_name": get("from_name"),
+        "retention_days": int(get("retention_days", "90") or 90),
+    }
+
+
+# ── archive index ────────────────────────────────────────────────────────────
+
+class Entry(NamedTuple):
+    path: Path
+    ts: float
+    mid: str
+    sid: str
+    subject: str
+    sender: str
+
+
+def _h(msg, name):
+    try:
+        return str(msg.get(name, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def scan(archive):
+    if not archive.is_dir():
+        die("archive %s does not exist — run pcm-reply-setup.sh" % archive)
+    if not os.access(str(archive), os.R_OK | os.X_OK):
+        die("no permission to read %s — run as root or: sudo -u pcmreply pcm-reply ..." % archive)
+    seen, out = set(), []
+    for sub in ("new", "cur"):
+        d = archive / sub
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            try:
+                st = p.stat()
+                with p.open("rb") as f:
+                    h = BytesHeaderParser(policy=policy.default).parse(f)
+            except OSError:
+                continue
+            mid = _h(h, "message-id")
+            key = mid or p.name
+            if key in seen:
+                continue
+            seen.add(key)
+            sid = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:8]
+            out.append(Entry(p, st.st_mtime, mid, sid, _h(h, "subject"), _h(h, "from")))
+    out.sort(key=lambda e: e.ts, reverse=True)
+    return out
+
+
+def select(entries, selector):
+    s = selector.strip()
+    low = s.lower()
+    if low.startswith("from:"):
+        needle = low[5:].strip()
+        return [e for e in entries if needle in e.sender.lower()]
+    norm = low.strip("<>")
+    exact = [e for e in entries if e.sid == norm or e.mid.strip("<>").lower() == norm]
+    if exact:
+        return exact[:1]
+    by_subject = [e for e in entries if low in e.subject.lower()]
+    if by_subject:
+        return by_subject
+    return [e for e in entries if low in e.sender.lower()]
+
+
+def _clip(text, width):
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def print_table(entries, stream=sys.stdout):
+    print("%-8s  %-16s  %-30s  %s" % ("ID", "RECEIVED", "FROM", "SUBJECT"), file=stream)
+    for e in entries:
+        when = datetime.fromtimestamp(e.ts).strftime("%Y-%m-%d %H:%M")
+        print("%-8s  %-16s  %-30s  %s" % (e.sid, when, _clip(e.sender, 30), _clip(e.subject, 60)),
+              file=stream)
+
+
+# ── original message → quoted text ───────────────────────────────────────────
+
+class _HTMLText(HTMLParser):
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+
+def html_to_text(src):
+    p = _HTMLText()
+    p.feed(src)
+    text = "".join(p.parts)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def original_text(msg):
+    part = msg.get_body(preferencelist=("plain", "html"))
+    if part is None:
+        return ""
+    try:
+        text = part.get_content()
+    except Exception:
+        return ""
+    return html_to_text(text) if part.get_content_type() == "text/html" else text
+
+
+def quote_block(orig):
+    sender = _h(orig, "from") or "the sender"
+    raw = _h(orig, "date")
+    try:
+        when = parsedate_to_datetime(raw).strftime("%a, %d %b %Y at %H:%M")
+    except Exception:
+        when = raw or "an earlier date"
+    lines = original_text(orig).replace("\r\n", "\n").strip().split("\n")[:MAX_QUOTE_LINES]
+    quoted = "\n".join(((">" if l.startswith(">") else "> ") + l) if l else ">" for l in lines)
+    return "On %s, %s wrote:\n%s" % (when, sender, quoted)
+
+
+# ── building the reply ───────────────────────────────────────────────────────
+
+Addr = Tuple[str, str]
+
+
+def _addrs(orig, header):
+    return [(n, a) for n, a in getaddresses([str(h) for h in orig.get_all(header, [])]) if a and "@" in a]
+
+
+def build_reply(orig, conf, from_override, quote, body, copy_to_gmail=True):
+    domains, gmail = conf["domains"], conf["gmail"]
+
+    def is_own(addr):
+        a = addr.lower()
+        return a == gmail or a.rsplit("@", 1)[-1] in domains
+
+    to_h, cc_h = _addrs(orig, "to"), _addrs(orig, "cc")
+    primary = _addrs(orig, "reply-to") or _addrs(orig, "from")
+
+    # which of our aliases was the mail sent to? (the one we answer from)
+    from_addr = from_override
+    if not from_addr:
+        for _, a in to_h + cc_h:
+            if a.rsplit("@", 1)[-1].lower() in domains:
+                from_addr = a
+                break
+    from_addr = from_addr or parseaddr_plain(conf["default_from"])
+    if not from_addr or "@" not in from_addr:
+        die("cannot tell which address to reply from (no own-domain address in To/Cc); "
+            "use --from ADDR or set default_from in %s" % CONF_PATH)
+
+    seen = set()
+
+    def uniq(pairs):
+        out = []
+        for n, a in pairs:
+            k = a.lower()
+            if k not in seen and not is_own(a):
+                seen.add(k)
+                out.append((n, a))
+        return out
+
+    to = uniq(primary + to_h)
+    cc = uniq(cc_h)
+    if not to:
+        die("nothing to reply to: sender/Reply-To is one of your own addresses and nobody else is on the message")
+
+    subject = _h(orig, "subject")
+    if not RE_PREFIX.match(subject):
+        subject = "Re: " + subject
+
+    msg = EmailMessage()
+    msg["From"] = formataddr((conf["from_name"], from_addr)) if conf["from_name"] else from_addr
+    msg["To"] = ", ".join(formataddr(x) for x in to)
+    if cc:
+        msg["Cc"] = ", ".join(formataddr(x) for x in cc)
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=from_addr.rsplit("@", 1)[-1])
+
+    mid = _h(orig, "message-id")
+    if MSGID_RE.match(mid):
+        msg["In-Reply-To"] = mid
+        refs = [r for r in _h(orig, "references").split() if MSGID_RE.match(r)]
+        msg["References"] = " ".join(refs + [mid])
+
+    text = body.rstrip() + "\n"
+    if quote:
+        q = quote_block(orig)
+        if q:
+            text += "\n" + q + "\n"
+    msg.set_content(text, cte="quoted-printable")
+
+    envelope = [a for _, a in to + cc]
+    if copy_to_gmail and gmail and gmail not in [a.lower() for a in envelope]:
+        envelope.append(gmail)  # Bcc: envelope only, not in headers
+    return msg, from_addr, envelope
+
+
+def parseaddr_plain(value):
+    from email.utils import parseaddr
+    return parseaddr(value)[1]
+
+
+def send(msg, from_addr, envelope):
+    r = subprocess.run([SENDMAIL, "-i", "-f", from_addr, "--"] + envelope, input=msg.as_bytes())
+    if r.returncode != 0:
+        die("sendmail exited with status %d" % r.returncode)
+
+
+# ── misc ─────────────────────────────────────────────────────────────────────
+
+def read_body(args):
+    if args.message is not None:
+        text = args.message
+    elif args.body_file:
+        text = (sys.stdin.buffer.read() if args.body_file == "-" else Path(args.body_file).read_bytes()
+                ).decode("utf-8", "replace")
+    elif not sys.stdin.isatty():
+        text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    else:
+        die("no message body: use -m TEXT, --body-file FILE, or pipe the text on stdin")
+    if not text.strip():
+        die("message body is empty")
+    return text
+
+
+def prune(archive, days):
+    cutoff, n = time.time() - days * 86400, 0
+    for sub in ("new", "cur"):
+        d = archive / sub
+        if d.is_dir():
+            for p in d.iterdir():
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                        n += 1
+                except OSError:
+                    pass
+    print("pruned %d message(s) older than %d days" % (n, days))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reply-all from the server to an archived message.")
+    ap.add_argument("selector", nargs="?", help="id / part of subject / from:sender")
+    ap.add_argument("-m", "--message", help="reply text")
+    ap.add_argument("--body-file", help="read reply text from FILE ('-' = stdin)")
+    ap.add_argument("--list", action="store_true", help="list archived messages instead of replying")
+    ap.add_argument("-n", type=int, default=20, help="rows for --list (default 20)")
+    ap.add_argument("--latest", action="store_true", help="if several messages match, use the newest")
+    ap.add_argument("--from", dest="from_addr", help="send as this address (default: the alias the mail was sent to)")
+    ap.add_argument("--no-quote", action="store_true", help="do not quote the original message")
+    ap.add_argument("--no-copy", action="store_true", help="do not Bcc a copy to your Gmail")
+    ap.add_argument("--dry-run", action="store_true", help="print the reply instead of sending it")
+    ap.add_argument("--prune", nargs="?", type=int, const=-1, metavar="DAYS",
+                    help="delete archived messages older than DAYS (default: retention_days from the config) and exit")
+    args = ap.parse_args()
+
+    conf = load_conf()
+    if args.prune is not None:
+        return prune(conf["archive"], conf["retention_days"] if args.prune < 0 else args.prune)
+
+    entries = scan(conf["archive"])
+    if args.list:
+        print_table((select(entries, args.selector) if args.selector else entries)[:args.n])
+        return 0
+    if not args.selector:
+        die("give a selector (id, subject or from:sender), or use --list", 2)
+
+    matches = select(entries, args.selector)
+    if not matches:
+        die("no archived message matches %r (see --list)" % args.selector, 2)
+    if len(matches) > 1 and not args.latest:
+        print("pcm-reply: %d messages match %r — use an id, or --latest:" % (len(matches), args.selector),
+              file=sys.stderr)
+        print_table(matches[:10], stream=sys.stderr)
+        return 2
+    entry = matches[0]
+
+    body = read_body(args)
+    with entry.path.open("rb") as f:
+        orig = BytesParser(policy=policy.default).parse(f)
+    msg, from_addr, envelope = build_reply(orig, conf, args.from_addr, not args.no_quote, body,
+                                           copy_to_gmail=not args.no_copy)
+    if args.dry_run:
+        print(msg.as_string())
+        print("--\nenvelope from: %s\nenvelope to:   %s" % (from_addr, ", ".join(envelope)))
+        return 0
+    send(msg, from_addr, envelope)
+    print("sent reply to %s  [%s: %s]" % (", ".join(envelope), entry.sid, _clip(entry.subject, 60)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

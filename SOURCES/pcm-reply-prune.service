@@ -1,0 +1,26 @@
+[Unit]
+Description=Prune old archived mail used by pcm-reply
+Documentation=file:///usr/share/doc/postfix-custom-mailserver/README.md
+# Only runs once pcm-reply-setup.sh has created the archive and config.
+ConditionPathExists=/etc/pcm-reply.conf
+ConditionPathExists=/home/pcmreply/Maildir
+
+[Service]
+Type=oneshot
+User=pcmreply
+Group=pcmreply
+# Retention comes from retention_days in /etc/pcm-reply.conf (default 90).
+ExecStart=/usr/bin/pcm-reply --prune
+
+# Hardening: it only needs to read its config and delete files in the archive.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/home/pcmreply
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+Nice=10
+IOSchedulingClass=idle
