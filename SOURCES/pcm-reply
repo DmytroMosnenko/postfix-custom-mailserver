@@ -14,6 +14,7 @@ Usage:
   pcm-reply --list [SELECTOR] [-n 20]      show archived messages (newest first)
   pcm-reply --prune [DAYS]                 delete archived mail older than DAYS (default: retention_days, 90)
   pcm-reply --show SELECTOR [--raw]        read a message (decoded text; --raw = full source)
+  pcm-reply --delete SELECTOR [--all] [-y] delete message(s) from the archive (asks first)
   pcm-reply --import FILE.eml              add an old message (e.g. from Gmail) to the archive; '-' = stdin
   pcm-reply SELECTOR -m "Thanks, done."    reply-all
   echo "text" | pcm-reply SELECTOR         body from stdin
@@ -98,7 +99,7 @@ def _h(msg, name):
         return ""
 
 
-def scan(archive):
+def scan(archive, dedupe=True):
     if not archive.is_dir():
         die("archive %s does not exist — run pcm-reply-setup.sh" % archive)
     if not os.access(str(archive), os.R_OK | os.X_OK):
@@ -117,7 +118,7 @@ def scan(archive):
                 continue
             mid = _h(h, "message-id")
             key = mid or p.name
-            if key in seen:
+            if dedupe and key in seen:
                 continue
             seen.add(key)
             sid = _sid(key)
@@ -211,6 +212,32 @@ def show(entry, raw):
     print()
     print(_safe(original_text(orig).replace("\r\n", "\n")).strip() or "(no text content)")
     return 0
+
+
+def delete_entries(conf, entries, yes, dry_run):
+    print_table(entries)
+    if dry_run:
+        print("(dry run) nothing deleted")
+        return 0
+    if not yes:
+        if not sys.stdin.isatty():
+            die("refusing to delete without a terminal; add --yes")
+        if input("Delete %d message(s)? [y/N] " % len(entries)).strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return 1
+    ids = set(e.sid for e in entries)
+    # a message may exist as several files (same Message-ID): remove every copy
+    targets = [e for e in scan(conf["archive"], dedupe=False) if e.sid in ids]
+    done, failed = 0, 0
+    for e in targets:
+        try:
+            e.path.unlink()
+            done += 1
+        except OSError as exc:
+            failed += 1
+            print("pcm-reply: could not delete %s (%s): %s" % (e.sid, e.path.name, exc), file=sys.stderr)
+    print("deleted %d file(s) for %d message(s)" % (done, len(ids)))
+    return 1 if failed else 0
 
 
 def print_table(entries, stream=sys.stdout):
@@ -408,6 +435,9 @@ def main():
     ap.add_argument("--body-file", help="read reply text from FILE ('-' = stdin)")
     ap.add_argument("--show", action="store_true", help="print the selected message instead of replying")
     ap.add_argument("--raw", action="store_true", help="with --show: print the raw message source")
+    ap.add_argument("--delete", action="store_true", help="delete the selected message(s) from the archive")
+    ap.add_argument("--all", action="store_true", help="with --delete: delete every match, not just one")
+    ap.add_argument("-y", "--yes", action="store_true", help="with --delete: do not ask for confirmation")
     ap.add_argument("--import", dest="import_file", metavar="FILE",
                     help="add a raw message (.eml, or '-' for stdin) to the archive and exit")
     ap.add_argument("--list", action="store_true", help="list archived messages instead of replying")
@@ -435,9 +465,13 @@ def main():
     if not args.selector:
         die("give a selector (id, subject or from:sender), or use --list", 2)
 
+    if args.all and not args.delete:
+        die("--all only makes sense together with --delete", 2)
     matches = select(entries, args.selector)
     if not matches:
         die("no archived message matches %r (see --list)" % args.selector, 2)
+    if args.delete and args.all:
+        return delete_entries(conf, matches, args.yes, args.dry_run)
     if len(matches) > 1 and not args.latest:
         print("pcm-reply: %d messages match %r — use an id, or --latest:" % (len(matches), args.selector),
               file=sys.stderr)
@@ -447,6 +481,8 @@ def main():
 
     if args.show:
         return show(entry, args.raw)
+    if args.delete:
+        return delete_entries(conf, [entry], args.yes, args.dry_run)
 
     body = read_body(args)
     with entry.path.open("rb") as f:

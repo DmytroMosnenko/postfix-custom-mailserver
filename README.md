@@ -224,6 +224,8 @@ Run as root, or as the archive user (`sudo -u pcmreply pcm-reply ...`).
 ```bash
 pcm-reply --list                          # archived messages, newest first, with 8-char ids
 pcm-reply --show 787a2d52                 # read a message: headers, attachment names, decoded text
+pcm-reply --delete 787a2d52               # remove a message from the archive (asks first; -y to skip)
+pcm-reply --delete from:spam@ --all -y    # remove every match
 pcm-reply --import old.eml                # add a message that arrived before setup (see below)
 pcm-reply --show "invoice" --latest --raw # full raw source (all headers)
 pcm-reply "invoice 2043" -m "Paid today, thanks."
@@ -241,6 +243,8 @@ of guessing; use an id or `--latest` (newest match).
 |---|---|
 | `-m TEXT`, `--body-file FILE` | Reply text (or pipe it on stdin; `--body-file -` = stdin) |
 | `--list [SELECTOR] [-n N]` | List archived messages instead of replying |
+| `--delete SELECTOR` | Delete the selected message from the archive after confirmation (several matches need an id, `--latest`, or `--all`) |
+| `--all`, `-y` / `--yes` | With `--delete`: delete every match / skip the confirmation (required without a terminal) |
 | `--import FILE` | Add a raw message (`.eml`, or `-` for stdin) to the archive and exit |
 | `--show SELECTOR [--raw]` | Print the selected message (decoded text and attachment names; `--raw` = raw source) instead of replying |
 | `--latest` | If several messages match, use the newest |
@@ -315,6 +319,7 @@ journalctl -u pcm-reply-prune.service
 - Removing the package unsets `recipient_bcc_maps` (if it still has the pcm-reply value) so the archive
   stops growing. `/home/pcmreply` and `/etc/pcm-reply.conf` are left in place; delete them by hand
   if you want the archived mail gone.
+- `--delete` only removes the server's archive copy; the mail in Gmail is untouched.
 - Requires Python 3.6+ (standard library only).
 
 ---
