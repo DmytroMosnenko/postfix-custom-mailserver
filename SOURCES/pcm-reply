@@ -11,7 +11,8 @@ text, From = the alias that received the mail) and hands it to the local
 `sendmail`, so OpenDKIM signs it like any other outgoing mail.
 
 Usage:
-  pcm-reply --list [SELECTOR] [-n 20]      show archived messages (newest first)
+  pcm-reply --list [SELECTOR] [-n 20|--all] show archived messages (newest first, default 20); TO = your alias,
+                                           GMAIL = ok / REJ <cause> / DEF <cause> from the Postfix log (--no-status: skip)
   pcm-reply --prune [DAYS]                 delete archived mail older than DAYS (default: retention_days, 90)
   pcm-reply --show SELECTOR [--raw]        read a message (decoded text; --raw = full source)
   pcm-reply --delete SELECTOR [--all] [-y] delete message(s) from the archive (asks first)
@@ -30,6 +31,8 @@ Needs Python 3.6+, standard library only. Run as root or as the archive user:
 """
 import argparse
 import configparser
+import glob
+import gzip
 import hashlib
 import os
 import re
@@ -78,6 +81,7 @@ def load_conf():
         "default_from": get("default_from"),      # used when no own address is found in To/Cc
         "from_name": get("from_name"),
         "retention_days": int(get("retention_days", "90") or 90),
+        "maillog": get("maillog"),                # optional glob; default /var/log/maillog* (or journalctl)
     }
 
 
@@ -90,6 +94,7 @@ class Entry(NamedTuple):
     sid: str
     subject: str
     sender: str
+    rcpt: str = "-"       # own-domain address(es) the mail was addressed to (To/Cc)
 
 
 def _h(msg, name):
@@ -99,7 +104,24 @@ def _h(msg, name):
         return ""
 
 
-def scan(archive, dedupe=True):
+def _own_rcpts(h, domains):
+    """Own-domain addresses in To/Cc: the alias(es) the mail was sent to."""
+    found, first = [], ""
+    try:
+        for name in ("to", "cc"):
+            for _, a in getaddresses([str(x) for x in h.get_all(name, [])]):
+                if not a:
+                    continue
+                if name == "to" and not first:
+                    first = a
+                if a.rsplit("@", 1)[-1].lower() in domains and a.lower() not in [f.lower() for f in found]:
+                    found.append(a)
+    except Exception:
+        return [], ""
+    return found, first
+
+
+def scan(archive, dedupe=True, domains=frozenset()):
     if not archive.is_dir():
         die("archive %s does not exist — run pcm-reply-setup.sh" % archive)
     if not os.access(str(archive), os.R_OK | os.X_OK):
@@ -122,7 +144,12 @@ def scan(archive, dedupe=True):
                 continue
             seen.add(key)
             sid = _sid(key)
-            out.append(Entry(p, st.st_mtime, mid, sid, _h(h, "subject"), _h(h, "from")))
+            own, first_to = _own_rcpts(h, domains)
+            if own:
+                rcpt = own[0] + (" +%d" % (len(own) - 1) if len(own) > 1 else "")
+            else:                                  # Bcc / list mail: only what the headers say, marked with ~
+                rcpt = "~" + first_to if first_to else "-"
+            out.append(Entry(p, st.st_mtime, mid, sid, _h(h, "subject"), _h(h, "from"), rcpt))
     out.sort(key=lambda e: e.ts, reverse=True)
     return out
 
@@ -191,13 +218,22 @@ def _clip(text, width):
     return text if len(text) <= width else text[:width - 1] + "…"
 
 
-def show(entry, raw):
+def show(conf, entry, raw):
     if raw:
         sys.stdout.write(_safe(entry.path.read_bytes().decode("utf-8", "replace")))
         return 0
     with entry.path.open("rb") as f:
         orig = BytesParser(policy=policy.default).parse(f)
     print("ID: %s" % entry.sid)
+    status, note = gmail_status(conf, [entry])
+    if status is not None:
+        label, detail = status.get(entry.sid, ("-", ""))
+        if label == "ok":
+            print("Gmail: delivered (accepted by Gmail)")
+        elif label == "-":
+            print("Gmail: no forward to Gmail found in the mail log")
+        else:
+            print("Gmail: %s — %s" % (label, _clip(detail, 300)))
     for name in ("From", "Reply-To", "To", "Cc", "Date", "Subject", "Message-ID"):
         value = _h(orig, name)
         if value:
@@ -214,6 +250,93 @@ def show(entry, raw):
     return 0
 
 
+CLEAN_RE = re.compile(r"\b([0-9A-Za-z]{6,}): message-id=(<[^>]*>)")
+DELIV_RE = re.compile(r"\b([0-9A-Za-z]{6,}): to=<([^>]*)>(?:, orig_to=<[^>]*>)?, relay=([^,]*),"
+                      r".*?dsn=([0-9.]+), status=(\w+)(?: \((.*)\))?\s*$")
+
+
+def _read_log(conf):
+    """-> (iterable of log lines | None, note). Postfix log file(s), else journalctl."""
+    pats = [conf["maillog"]] if conf["maillog"] else ["/var/log/maillog*", "/var/log/mail.log*"]
+    files = sorted((f for pat in pats for f in glob.glob(pat) if os.path.isfile(f)),
+                   key=lambda f: os.stat(f).st_mtime)
+    if files:
+        readable = [f for f in files if os.access(f, os.R_OK)]
+        if not readable:
+            return None, "mail log %s is not readable (run as root)" % files[-1]
+
+        def gen():
+            for f in readable:
+                try:
+                    with (gzip.open if f.endswith(".gz") else open)(f, "rt", errors="replace") as fh:
+                        for line in fh:
+                            yield line
+                except OSError:
+                    continue
+        return gen(), ""
+    if shutil.which("journalctl"):
+        try:
+            r = subprocess.run(["journalctl", "-u", "postfix", "-o", "cat", "--no-pager", "-q",
+                                "--since", "30 days ago"], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=120)
+            text = r.stdout.decode("utf-8", "replace")
+            if text.strip():
+                return text.splitlines(), ""
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None, "no Postfix log found (set maillog = /path/to/log in %s)" % CONF_PATH
+
+
+def _short_cause(status, dsn, text):
+    t = text.lower()
+    kind = "REJ" if status == "bounced" else "DEF"
+    if "unsolicited" in t or "spam" in t:
+        why = "spam"
+    elif any(k in t for k in ("spf", "dkim", "dmarc", "authenticat", "arc ")):
+        why = "auth"
+    elif any(k in t for k in ("rate limit", "ratelimit", "too many", "temporarily")):
+        why = "rate"
+    elif any(k in t for k in ("quota", "mailbox full")):
+        why = "quota"
+    elif "too large" in t or "message size" in t:
+        why = "size"
+    elif any(k in t for k in ("does not exist", "no such user", "user unknown")):
+        why = "no-user"
+    else:
+        why = dsn
+    return "%s %s" % (kind, why)
+
+
+def gmail_status(conf, entries):
+    """sid -> (short label, detail) for how the forward to your Gmail ended, or (None, note)."""
+    lines, note = _read_log(conf)
+    if lines is None:
+        return None, note
+    wanted = dict((e.mid.lower(), e.sid) for e in entries if e.mid)
+    qid_sid, result = {}, {}
+    gmail = conf["gmail"]
+    for line in lines:
+        if "message-id=<" in line:
+            m = CLEAN_RE.search(line)
+            if m and m.group(2).lower() in wanted:
+                qid_sid[m.group(1)] = wanted[m.group(2).lower()]
+        elif " status=" in line and qid_sid:
+            m = DELIV_RE.search(line)
+            if not m or m.group(1) not in qid_sid:
+                continue
+            qid, rcpt, relay, dsn, status, text = m.groups()
+            if not ((gmail and rcpt.lower() == gmail) or relay.lower().startswith("gmail-smtp-in")):
+                continue
+            text = text or ""
+            if status == "sent":
+                result[qid_sid[qid]] = ("ok", "accepted by Gmail")
+            else:
+                detail = text.split("said:", 1)[-1] if "said:" in text else text
+                result[qid_sid[qid]] = (_short_cause(status, dsn, text),
+                                        "%s %s: %s" % (status, dsn, " ".join(detail.split())))
+    return result, ""
+
+
 def delete_entries(conf, entries, yes, dry_run):
     print_table(entries)
     if dry_run:
@@ -227,7 +350,7 @@ def delete_entries(conf, entries, yes, dry_run):
             return 1
     ids = set(e.sid for e in entries)
     # a message may exist as several files (same Message-ID): remove every copy
-    targets = [e for e in scan(conf["archive"], dedupe=False) if e.sid in ids]
+    targets = [e for e in scan(conf["archive"], dedupe=False, domains=conf["domains"]) if e.sid in ids]
     done, failed = 0, 0
     for e in targets:
         try:
@@ -240,12 +363,24 @@ def delete_entries(conf, entries, yes, dry_run):
     return 1 if failed else 0
 
 
-def print_table(entries, stream=sys.stdout):
-    print("%-8s  %-16s  %-30s  %s" % ("ID", "RECEIVED", "FROM", "SUBJECT"), file=stream)
+def print_table(entries, stream=sys.stdout, status=None):
+    from_w, to_w, st_w = 26, 26, 12
+    cols = shutil.get_terminal_size((120, 24)).columns
+    if status is None:
+        subj_w = max(20, cols - (8 + 16 + from_w + to_w + 8))     # gaps of 2 chars
+        fmt = "%-8s  %-16s  %-{0}s  %-{1}s  %s".format(from_w, to_w)
+        print(fmt % ("ID", "RECEIVED", "FROM", "TO", "SUBJECT"), file=stream)
+    else:
+        subj_w = max(20, cols - (8 + 16 + from_w + to_w + st_w + 10))
+        fmt = "%-8s  %-16s  %-{0}s  %-{1}s  %-{2}s  %s".format(from_w, to_w, st_w)
+        print(fmt % ("ID", "RECEIVED", "FROM", "TO", "GMAIL", "SUBJECT"), file=stream)
     for e in entries:
         when = datetime.fromtimestamp(e.ts).strftime("%Y-%m-%d %H:%M")
-        print("%-8s  %-16s  %-30s  %s" % (e.sid, when, _clip(e.sender, 30), _clip(e.subject, 60)),
-              file=stream)
+        row = [e.sid, when, _clip(e.sender, from_w), _clip(e.rcpt, to_w)]
+        if status is not None:
+            row.append(status.get(e.sid, ("-", ""))[0])
+        row.append(_clip(e.subject, subj_w))
+        print(fmt % tuple(row), file=stream)
 
 
 # ── original message → quoted text ───────────────────────────────────────────
@@ -436,12 +571,14 @@ def main():
     ap.add_argument("--show", action="store_true", help="print the selected message instead of replying")
     ap.add_argument("--raw", action="store_true", help="with --show: print the raw message source")
     ap.add_argument("--delete", action="store_true", help="delete the selected message(s) from the archive")
-    ap.add_argument("--all", action="store_true", help="with --delete: delete every match, not just one")
+    ap.add_argument("--all", action="store_true",
+                    help="with --list: show everything; with --delete: delete every match, not just one")
     ap.add_argument("-y", "--yes", action="store_true", help="with --delete: do not ask for confirmation")
     ap.add_argument("--import", dest="import_file", metavar="FILE",
                     help="add a raw message (.eml, or '-' for stdin) to the archive and exit")
     ap.add_argument("--list", action="store_true", help="list archived messages instead of replying")
-    ap.add_argument("-n", type=int, default=20, help="rows for --list (default 20)")
+    ap.add_argument("-n", type=int, default=20, help="rows for --list (default 20; 0 = all)")
+    ap.add_argument("--no-status", action="store_true", help="--list: skip reading the Postfix log (faster)")
     ap.add_argument("--latest", action="store_true", help="if several messages match, use the newest")
     ap.add_argument("--from", dest="from_addr", help="send as this address (default: the alias the mail was sent to)")
     ap.add_argument("--no-quote", action="store_true", help="do not quote the original message")
@@ -458,15 +595,24 @@ def main():
     if args.import_file:
         return import_message(conf, args.import_file)
 
-    entries = scan(conf["archive"])
+    entries = scan(conf["archive"], domains=conf["domains"])
     if args.list:
-        print_table((select(entries, args.selector) if args.selector else entries)[:args.n])
+        found = select(entries, args.selector) if args.selector else entries
+        shown = found if (args.all or args.n <= 0) else found[:args.n]
+        status = None
+        if not args.no_status and shown:
+            status, note = gmail_status(conf, shown)
+            if status is None:
+                print("pcm-reply: GMAIL column unavailable: %s" % note, file=sys.stderr)
+        print_table(shown, status=status)
+        if len(shown) < len(found) and sys.stdout.isatty():     # hint only for humans, not for pipes
+            print("(showing %d of %d; -n N for more, --all for everything)" % (len(shown), len(found)))
         return 0
     if not args.selector:
         die("give a selector (id, subject or from:sender), or use --list", 2)
 
     if args.all and not args.delete:
-        die("--all only makes sense together with --delete", 2)
+        die("--all only makes sense with --list or --delete", 2)
     matches = select(entries, args.selector)
     if not matches:
         die("no archived message matches %r (see --list)" % args.selector, 2)
@@ -480,7 +626,7 @@ def main():
     entry = matches[0]
 
     if args.show:
-        return show(entry, args.raw)
+        return show(conf, entry, args.raw)
     if args.delete:
         return delete_entries(conf, [entry], args.yes, args.dry_run)
 
@@ -499,4 +645,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:                     # e.g. `pcm-reply --list | head`
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

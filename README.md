@@ -222,7 +222,8 @@ It refuses to overwrite a `recipient_bcc_maps` you already use for something els
 Run as root, or as the archive user (`sudo -u pcmreply pcm-reply ...`).
 
 ```bash
-pcm-reply --list                          # archived messages, newest first, with 8-char ids
+pcm-reply --list                          # the 20 newest messages: id, date, FROM, TO (your alias), GMAIL, subject
+pcm-reply --list -n 100                   # the 100 newest (-n 0 or --all: everything)
 pcm-reply --show 787a2d52                 # read a message: headers, attachment names, decoded text
 pcm-reply --delete 787a2d52               # remove a message from the archive (asks first; -y to skip)
 pcm-reply --delete from:spam@ --all -y    # remove every match
@@ -242,9 +243,11 @@ of guessing; use an id or `--latest` (newest match).
 | Option | Meaning |
 |---|---|
 | `-m TEXT`, `--body-file FILE` | Reply text (or pipe it on stdin; `--body-file -` = stdin) |
-| `--list [SELECTOR] [-n N]` | List archived messages instead of replying |
+| `--list [SELECTOR] [-n N]` | List archived messages instead of replying; shows the newest 20 unless `-n N` is given. On a terminal a last line says how many more exist (`showing 20 of 134; -n N for more, --all for everything`); it is not printed into pipes |
+| `--no-status` | With `--list`: skip reading the Postfix log (no GMAIL column, faster) |
 | `--delete SELECTOR` | Delete the selected message from the archive after confirmation (several matches need an id, `--latest`, or `--all`) |
-| `--all`, `-y` / `--yes` | With `--delete`: delete every match / skip the confirmation (required without a terminal) |
+| `--all` | With `--list`: show every message. With `--delete`: delete every match, not just one |
+| `-y`, `--yes` | With `--delete`: skip the confirmation (required without a terminal) |
 | `--import FILE` | Add a raw message (`.eml`, or `-` for stdin) to the archive and exit |
 | `--show SELECTOR [--raw]` | Print the selected message (decoded text and attachment names; `--raw` = raw source) instead of replying |
 | `--latest` | If several messages match, use the newest |
@@ -253,6 +256,28 @@ of guessing; use an id or `--latest` (newest match).
 | `--no-copy` | Do not Bcc a copy to your Gmail |
 | `--dry-run` | Print the reply and envelope, send nothing |
 | `--prune [DAYS]` | Delete archived mail older than DAYS (default: `retention_days`) and exit |
+
+**The TO column** shows which of your own addresses the mail was sent to, taken from the To/Cc headers
+(`+N` = more of your addresses on the same mail). If none of your domains appears in To/Cc (Bcc, mailing
+lists, "undisclosed recipients"), it shows the first To address with a `~` prefix, or `-` if there is none;
+the real envelope recipient is then only visible in the Postfix log.
+
+**The GMAIL column** tells you how the forward to your Gmail ended, read from the Postfix log
+(`/var/log/maillog*` including rotated and `.gz` files, or `journalctl -u postfix` if there is no log file):
+
+| Value | Meaning |
+|---|---|
+| `ok` | Gmail accepted the message |
+| `REJ spam` | Gmail refused it at SMTP time (`bounced`, e.g. 550-5.7.1 "likely unsolicited mail"). It never reaches the spam folder; the archive copy is the only one |
+| `REJ auth` / `REJ rate` / `REJ quota` / `REJ size` / `REJ no-user` | other refusal reasons; anything unrecognised shows the code, e.g. `REJ 5.7.26` |
+| `DEF …` | still being retried (`deferred`), same causes |
+| `-` | no forward to Gmail found in the log (older than the log rotation, not forwarded, or the log is unreadable) |
+
+`pcm-reply --show ID` prints the same status with Postfix's full reason on a `Gmail:` line.
+Reading the log needs root (`/var/log/maillog` is usually mode 0600); as another user the column is omitted with a
+note. To use a different log location set `maillog = /path/glob*` in `/etc/pcm-reply.conf`.
+Only the last ~month of log is usually available, and `--list --no-status` skips the log scan.
+To see only refused mails: `pcm-reply --list -n 500 | grep -E 'REJ|DEF'`.
 
 **What a reply looks like**
 
@@ -293,6 +318,7 @@ gmail          = you@gmail.com
 default_from   = support@yourdomain.com
 from_name      = Your Name
 retention_days = 90
+# maillog      = /var/log/maillog*    # optional: where the GMAIL column reads Postfix's log
 ```
 
 ### Archive retention
